@@ -35,7 +35,7 @@ constexpr float kMaxCenterOffset = 0.42F; // 竖直中心差 / 平均灯条高�
 constexpr float kMaxTiltDiff = 20.0F;     // 倾斜角差，单位度
 constexpr float kMinGapRatio = 0.28F;     // 灯条净间距 / 平均灯条高度
 constexpr float kMaxGapRatio = 4.50F;
-constexpr float kMinArmorAspect = 1.35F;  // 装甲板外接框 宽/高
+constexpr float kMinArmorAspect = 1.60F;  // 装甲板外接框 宽/高
 constexpr float kMaxArmorAspect = 5.00F;
 constexpr float kLargeArmorAspect = 2.85F; // 超过即视为大装甲板（哨兵）
 constexpr float kMinConfidence = 0.55F;
@@ -200,6 +200,12 @@ std::vector<Armor> lesson03_detection(const cv::Mat& image) {
       if (center_offset > kMaxCenterOffset) continue;
 
       if (std::abs(left.tilt - right.tilt) > kMaxTiltDiff) continue;
+
+      // 两根灯条粗细要接近：把支架、栏杆上粗细不同的两根竖条排除掉。
+      if (std::abs(left.width - right.width) /
+              std::max(left.width, right.width) > 0.5F) {
+        continue;
+      }
 
       // 净间距 = 两根灯条内侧边之间的距离。
       const float gap = (right.top.x - right.width * 0.5F) -
