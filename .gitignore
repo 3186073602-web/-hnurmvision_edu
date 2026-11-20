@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 训练中间产物（只保留最终权重与曲线）
+runs/
+dataset/
+
+# 系统
+.DS_Store
