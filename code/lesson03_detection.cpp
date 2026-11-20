@@ -125,6 +125,24 @@ std::array<cv::Point2f, 4> makeCorners(const LightBar& left, const LightBar& rig
   return corners;
 }
 
+// 灯条只占装甲板两侧的一部分：上下各有约 1/4 板高的边框，左右也略宽。
+// 检测框按灯条外沿算出后，再围绕中心放大到整块板的范围。
+constexpr float kPlateWiden = 1.35F;
+constexpr float kPlateTall = 2.05F;
+
+std::array<cv::Point2f, 4> expandToPlate(const std::array<cv::Point2f, 4>& corners,
+                                         float widen, float tall) {
+  cv::Point2f center{0.0F, 0.0F};
+  for (const auto& p : corners) center += p;
+  center *= 0.25F;
+  std::array<cv::Point2f, 4> out{};
+  for (std::size_t i = 0; i < 4; ++i) {
+    out[i] = {center.x + (corners[i].x - center.x) * widen,
+              center.y + (corners[i].y - center.y) * tall};
+  }
+  return out;
+}
+
 float quadWidth(const std::array<cv::Point2f, 4>& c) {
   return 0.5F * (static_cast<float>(cv::norm(c[1] - c[0])) +
                  static_cast<float>(cv::norm(c[2] - c[3])));
@@ -209,7 +227,8 @@ std::vector<Armor> lesson03_detection(const cv::Mat& image) {
       if (confidence < kMinConfidence) continue;
 
       Armor armor;
-      armor.corners = corners;
+      // 角点放大到整块装甲板（大小板判定仍用灯条外沿的宽高比）。
+      armor.corners = expandToPlate(corners, kPlateWiden, kPlateTall);
       armor.large_armor = aspect > kLargeArmorAspect;
       armor.class_id = -1;  // 本讲不做数字识别，无法读取编号
       armor.confidence = std::min(0.99F, std::max(0.0F, confidence));
