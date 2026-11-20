@@ -1,5 +1,5 @@
 diff --git a/include/lessons.hpp b/include/lessons.hpp
-index 86fa46e..70da71e 100644
+index 86fa46e..c990391 100644
 --- a/include/lessons.hpp
 +++ b/include/lessons.hpp
 @@ -6,6 +6,13 @@
@@ -7,12 +7,12 @@ index 86fa46e..70da71e 100644
  namespace training {
  std::vector<Armor> lesson03_detection(const cv::Mat& image);
 +
-+// 能量机关（能量装置）观测：外接框四角 + 置信度。没有机关时返回 nullopt。
++// 能量机关（能量装置）观测：每个圆形小装置一个紧贴的小框 + 置信度。
 +struct Rune {
 +  std::array<cv::Point2f, 4> corners{};  // 左上、右上、右下、左下
 +  double confidence = 0;
 +};
-+std::optional<Rune> lesson03_rune_detection(const cv::Mat& image);
++std::vector<Rune> lesson03_rune_detection(const cv::Mat& image);
  std::optional<Target> lesson04_tracking(const std::vector<Armor>& armors,
      TimePoint timestamp, const Eigen::Quaterniond& imu_q, const CameraCalibration& calibration, TrackingState& state);
  Command lesson05_aiming(const Target& target, TimePoint timestamp, double bullet_speed);
@@ -172,10 +172,10 @@ index a7f8efc..9ac773f 100644
  }
  }  // namespace training::io
 diff --git a/lessons/lesson03_detection.cpp b/lessons/lesson03_detection.cpp
-index c9cbbd8..332e2f2 100644
+index c9cbbd8..e3e7b5d 100644
 --- a/lessons/lesson03_detection.cpp
 +++ b/lessons/lesson03_detection.cpp
-@@ -1,13 +1,314 @@
+@@ -1,13 +1,322 @@
  #include "lessons.hpp"
  
 +#include <opencv2/imgproc.hpp>
@@ -422,13 +422,14 @@ index c9cbbd8..332e2f2 100644
 +
 +namespace training {
 +namespace {
-+// 能量机关（能量装置）识别。
++
++// 能量机关（能量装置）识别：每个黄色圆形小装置单独出一个小框。
 +//
-+// 能量机关上有若干个黄色圆形 R 标记。按颜色 + 圆度把标记找出来，再用标记之间的
-+// 距离估计机关中心与尺寸；机关整体远大于标记，所以框按标记间距的 2.6 倍扩张。
++// 能量机关的叶轮上有若干个黄色圆形 R 标记。按颜色 + 圆度把它们逐个找出来，
++// 每个标记画一个紧贴它的小框（不再用一个大框把整个机关包进去）。
 +struct RuneMark {
-+  cv::Point2f center;
-+  float size = 0;
++  cv::Rect box;
++  float circularity = 0;
 +  double area = 0;
 +};
 +
@@ -460,45 +461,52 @@ index c9cbbd8..332e2f2 100644
 +    if (aspect < 0.5F || aspect > 2.0F) continue;
 +
 +    RuneMark mark;
-+    mark.center = cv::Point2f(box.x + box.width * 0.5F, box.y + box.height * 0.5F);
-+    mark.size = static_cast<float>(std::max(box.width, box.height));
++    mark.box = box;
++    mark.circularity = static_cast<float>(circularity);
 +    mark.area = area;
 +    marks.push_back(mark);
 +  }
-+  return marks;
++
++  // 同一个装置可能被闭运算拆成两个候选，按 IoU 去重。
++  std::sort(marks.begin(), marks.end(),
++            [](const RuneMark& a, const RuneMark& b) { return a.area > b.area; });
++  std::vector<RuneMark> kept;
++  for (const auto& mark : marks) {
++    bool duplicate = false;
++    for (const auto& other : kept) {
++      const float inter = static_cast<float>((mark.box & other.box).area());
++      const float uni = static_cast<float>(mark.box.area() + other.box.area()) - inter;
++      if (uni > 0 && inter / uni > 0.5F) { duplicate = true; break; }
++    }
++    if (!duplicate) kept.push_back(mark);
++  }
++  return kept;
 +}
 +}  // namespace
 +
-+std::optional<Rune> lesson03_rune_detection(const cv::Mat& image) {
-+  if (image.empty() || image.type() != CV_8UC3) return std::nullopt;
++std::vector<Rune> lesson03_rune_detection(const cv::Mat& image) {
++  std::vector<Rune> runes;
++  if (image.empty() || image.type() != CV_8UC3) return runes;
 +
-+  std::vector<RuneMark> marks = findRuneMarks(image);
-+  if (marks.size() < 2) return std::nullopt;
++  for (const auto& mark : findRuneMarks(image)) {
++    // 紧贴标记的小框，留 15% 余量，避免框线压住标记本身。
++    const float pad = std::max(mark.box.width, mark.box.height) * 0.15F;
++    const cv::Rect2f box(mark.box.x - pad, mark.box.y - pad,
++                         mark.box.width + 2 * pad, mark.box.height + 2 * pad);
 +
-+  // 取面积最大的一对：能量机关的标记比场地上的黄色装饰更大更圆。
-+  std::sort(marks.begin(), marks.end(),
-+            [](const RuneMark& a, const RuneMark& b) { return a.area > b.area; });
-+  const RuneMark& first = marks[0];
-+  const RuneMark& second = marks[1];
-+
-+  const cv::Point2f delta = second.center - first.center;
-+  const float distance = static_cast<float>(cv::norm(delta));
-+  if (distance < 20.0F) return std::nullopt;
-+
-+  const cv::Point2f center = (first.center + second.center) * 0.5F;
-+  const float half = distance * 1.3F;  // 机关半径约为标记间距的 1.3 倍
-+
-+  Rune rune;
-+  rune.corners[0] = {center.x - half, center.y - half};
-+  rune.corners[1] = {center.x + half, center.y - half};
-+  rune.corners[2] = {center.x + half, center.y + half};
-+  rune.corners[3] = {center.x - half, center.y + half};
-+  rune.confidence = std::min(0.95, 0.55 + 0.10 * static_cast<double>(std::min<std::size_t>(marks.size(), 4)));
-+  return rune;
++    Rune rune;
++    rune.corners[0] = {box.x, box.y};
++    rune.corners[1] = {box.x + box.width, box.y};
++    rune.corners[2] = {box.x + box.width, box.y + box.height};
++    rune.corners[3] = {box.x, box.y + box.height};
++    rune.confidence = std::min(0.99, 0.55 + 0.45 * static_cast<double>(mark.circularity));
++    runes.push_back(rune);
++  }
++  return runes;
  }
  }  // namespace training
 diff --git a/src/main.cpp b/src/main.cpp
-index 4a7bf8c..e813c3f 100644
+index 4a7bf8c..f398e39 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
 @@ -1,13 +1,79 @@
@@ -527,8 +535,8 @@ index 4a7bf8c..e813c3f 100644
 +  }
 +  char label[48];
 +  std::snprintf(label, sizeof(label), "RUNE %.2f", rune.confidence);
-+  cv::putText(frame, label, cv::Point(polygon[0].x, std::max(16, polygon[0].y - 8)),
-+              cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 235, 255), 2, cv::LINE_AA);
++  cv::putText(frame, label, cv::Point(polygon[0].x, std::max(14, polygon[0].y - 6)),
++              cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 235, 255), 1, cv::LINE_AA);
  }
  
 +void drawArmors(cv::Mat& frame, const std::vector<training::Armor>& armors) {
@@ -609,10 +617,10 @@ index 4a7bf8c..e813c3f 100644
      training::Command command{};
      if (input) {
        const auto armors = training::lesson03_detection(input->image);
-+      const auto rune = training::lesson03_rune_detection(input->image);
++      const auto runes = training::lesson03_rune_detection(input->image);
 +      if (devices.config.display) {
 +        drawArmors(input->image, armors);
-+        if (rune) drawRune(input->image, *rune);
++        for (const auto& rune : runes) drawRune(input->image, rune);
 +      }
        const auto target = training::lesson04_tracking(
            armors, input->timestamp, input->imu_q, calibration, tracking);

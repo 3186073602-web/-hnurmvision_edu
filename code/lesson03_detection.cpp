@@ -237,13 +237,14 @@ std::vector<Armor> lesson03_detection(const cv::Mat& image) {
 
 namespace training {
 namespace {
-// 能量机关（能量装置）识别。
+
+// 能量机关（能量装置）识别：每个黄色圆形小装置单独出一个小框。
 //
-// 能量机关上有若干个黄色圆形 R 标记。按颜色 + 圆度把标记找出来，再用标记之间的
-// 距离估计机关中心与尺寸；机关整体远大于标记，所以框按标记间距的 2.6 倍扩张。
+// 能量机关的叶轮上有若干个黄色圆形 R 标记。按颜色 + 圆度把它们逐个找出来，
+// 每个标记画一个紧贴它的小框（不再用一个大框把整个机关包进去）。
 struct RuneMark {
-  cv::Point2f center;
-  float size = 0;
+  cv::Rect box;
+  float circularity = 0;
   double area = 0;
 };
 
@@ -275,40 +276,47 @@ std::vector<RuneMark> findRuneMarks(const cv::Mat& image) {
     if (aspect < 0.5F || aspect > 2.0F) continue;
 
     RuneMark mark;
-    mark.center = cv::Point2f(box.x + box.width * 0.5F, box.y + box.height * 0.5F);
-    mark.size = static_cast<float>(std::max(box.width, box.height));
+    mark.box = box;
+    mark.circularity = static_cast<float>(circularity);
     mark.area = area;
     marks.push_back(mark);
   }
-  return marks;
+
+  // 同一个装置可能被闭运算拆成两个候选，按 IoU 去重。
+  std::sort(marks.begin(), marks.end(),
+            [](const RuneMark& a, const RuneMark& b) { return a.area > b.area; });
+  std::vector<RuneMark> kept;
+  for (const auto& mark : marks) {
+    bool duplicate = false;
+    for (const auto& other : kept) {
+      const float inter = static_cast<float>((mark.box & other.box).area());
+      const float uni = static_cast<float>(mark.box.area() + other.box.area()) - inter;
+      if (uni > 0 && inter / uni > 0.5F) { duplicate = true; break; }
+    }
+    if (!duplicate) kept.push_back(mark);
+  }
+  return kept;
 }
 }  // namespace
 
-std::optional<Rune> lesson03_rune_detection(const cv::Mat& image) {
-  if (image.empty() || image.type() != CV_8UC3) return std::nullopt;
+std::vector<Rune> lesson03_rune_detection(const cv::Mat& image) {
+  std::vector<Rune> runes;
+  if (image.empty() || image.type() != CV_8UC3) return runes;
 
-  std::vector<RuneMark> marks = findRuneMarks(image);
-  if (marks.size() < 2) return std::nullopt;
+  for (const auto& mark : findRuneMarks(image)) {
+    // 紧贴标记的小框，留 15% 余量，避免框线压住标记本身。
+    const float pad = std::max(mark.box.width, mark.box.height) * 0.15F;
+    const cv::Rect2f box(mark.box.x - pad, mark.box.y - pad,
+                         mark.box.width + 2 * pad, mark.box.height + 2 * pad);
 
-  // 取面积最大的一对：能量机关的标记比场地上的黄色装饰更大更圆。
-  std::sort(marks.begin(), marks.end(),
-            [](const RuneMark& a, const RuneMark& b) { return a.area > b.area; });
-  const RuneMark& first = marks[0];
-  const RuneMark& second = marks[1];
-
-  const cv::Point2f delta = second.center - first.center;
-  const float distance = static_cast<float>(cv::norm(delta));
-  if (distance < 20.0F) return std::nullopt;
-
-  const cv::Point2f center = (first.center + second.center) * 0.5F;
-  const float half = distance * 1.3F;  // 机关半径约为标记间距的 1.3 倍
-
-  Rune rune;
-  rune.corners[0] = {center.x - half, center.y - half};
-  rune.corners[1] = {center.x + half, center.y - half};
-  rune.corners[2] = {center.x + half, center.y + half};
-  rune.corners[3] = {center.x - half, center.y + half};
-  rune.confidence = std::min(0.95, 0.55 + 0.10 * static_cast<double>(std::min<std::size_t>(marks.size(), 4)));
-  return rune;
+    Rune rune;
+    rune.corners[0] = {box.x, box.y};
+    rune.corners[1] = {box.x + box.width, box.y};
+    rune.corners[2] = {box.x + box.width, box.y + box.height};
+    rune.corners[3] = {box.x, box.y + box.height};
+    rune.confidence = std::min(0.99, 0.55 + 0.45 * static_cast<double>(mark.circularity));
+    runes.push_back(rune);
+  }
+  return runes;
 }
 }  // namespace training

@@ -23,8 +23,8 @@ void drawRune(cv::Mat& frame, const training::Rune& rune) {
   }
   char label[48];
   std::snprintf(label, sizeof(label), "RUNE %.2f", rune.confidence);
-  cv::putText(frame, label, cv::Point(polygon[0].x, std::max(16, polygon[0].y - 8)),
-              cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 235, 255), 2, cv::LINE_AA);
+  cv::putText(frame, label, cv::Point(polygon[0].x, std::max(14, polygon[0].y - 6)),
+              cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 235, 255), 1, cv::LINE_AA);
 }
 
 void drawArmors(cv::Mat& frame, const std::vector<training::Armor>& armors) {
@@ -106,10 +106,10 @@ int main(int argc, char** argv) {
     training::Command command{};
     if (input) {
       const auto armors = training::lesson03_detection(input->image);
-      const auto rune = training::lesson03_rune_detection(input->image);
+      const auto runes = training::lesson03_rune_detection(input->image);
       if (devices.config.display) {
         drawArmors(input->image, armors);
-        if (rune) drawRune(input->image, *rune);
+        for (const auto& rune : runes) drawRune(input->image, rune);
       }
       const auto target = training::lesson04_tracking(
           armors, input->timestamp, input->imu_q, calibration, tracking);
