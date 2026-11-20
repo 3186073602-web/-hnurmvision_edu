@@ -117,7 +117,7 @@ R1 0.850、R2 0.851、R3 0.879、R4 0.884、R5 0.897、RO 0.958、RS 0.989。
 
 ![能量机关训练曲线](artifacts/rune/curves/results.png)
 
-![能量机关关键点推理](artifacts/rune/inference/val_and_train/141.png)
+![能量机关关键点推理](artifacts/rune/inference/val_and_train/141.jpg)
 
 ### 复现
 
