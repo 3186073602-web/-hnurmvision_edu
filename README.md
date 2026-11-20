@@ -9,7 +9,7 @@ RoboMaster 校队二阶段培训考核的提交物：基于 `Exusiai-R/hnurmvisi
 ```
 .
 ├── demo/
-│   └── armor_demo_20s.mp4          # 20.0s · 1440×1080 · 30fps · H.264
+│   └── armor_demo_20s.mp4          # 20.0s · 1440×1080 · 30fps · H.264 Baseline（兼容性最好）
 ├── code/
 │   ├── lesson02_io.cpp             # 第二讲：/image_raw 订阅 + /vision_send_data 发布
 │   ├── lesson03_detection.cpp      # 第三讲：传统视觉装甲板检测
