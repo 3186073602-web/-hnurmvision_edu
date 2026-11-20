@@ -13,6 +13,20 @@ void on_signal(int) { interrupted = 1; }
 
 // 把第三讲的检测结果画到显示画面上。检测本身在 lesson03_detection 里完成，
 // 这里只负责可视化：角点顺序为左上、右上、右下、左下，与 types.hpp 的约定一致。
+void drawRune(cv::Mat& frame, const training::Rune& rune) {
+  cv::Point polygon[4];
+  for (int i = 0; i < 4; ++i) {
+    polygon[i] = cv::Point(cvRound(rune.corners[i].x), cvRound(rune.corners[i].y));
+  }
+  for (int i = 0; i < 4; ++i) {
+    cv::line(frame, polygon[i], polygon[(i + 1) % 4], cv::Scalar(0, 235, 255), 2, cv::LINE_AA);
+  }
+  char label[48];
+  std::snprintf(label, sizeof(label), "RUNE %.2f", rune.confidence);
+  cv::putText(frame, label, cv::Point(polygon[0].x, std::max(16, polygon[0].y - 8)),
+              cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 235, 255), 2, cv::LINE_AA);
+}
+
 void drawArmors(cv::Mat& frame, const std::vector<training::Armor>& armors) {
   for (const auto& armor : armors) {
     // corners 是 Point2f，必须逐个取整，不能把 float 直接按 int 重解释。
@@ -92,7 +106,11 @@ int main(int argc, char** argv) {
     training::Command command{};
     if (input) {
       const auto armors = training::lesson03_detection(input->image);
-      if (devices.config.display) drawArmors(input->image, armors);
+      const auto rune = training::lesson03_rune_detection(input->image);
+      if (devices.config.display) {
+        drawArmors(input->image, armors);
+        if (rune) drawRune(input->image, *rune);
+      }
       const auto target = training::lesson04_tracking(
           armors, input->timestamp, input->imu_q, calibration, tracking);
       if (target)

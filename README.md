@@ -1,41 +1,59 @@
-# 装甲板检测 · 二阶段考核交付（第三讲 + 神经网络训练产物）
+# 装甲板 + 能量机关识别 · 二阶段考核交付
 
-RoboMaster 校队二阶段培训考核的提交物：基于 `Exusiai-R/hnurmvision_edu` 的第三讲
-装甲板检测实现、20 秒仿真演示视频，以及在**老师提供的数据集**上训练的 14 类装甲板
-检测网络产物。
+RoboMaster 校队二阶段培训考核的提交物：基于 `Exusiai-R/hnurmvision_edu` 的第三讲检测实现
+（装甲板 + 能量机关）、20 秒仿真演示视频，以及在**老师提供的数据集**上训练的
+装甲板检测网络与能量机关 Pose 网络产物。
 
 ## 目录
 
 ```
 .
 ├── demo/
-│   └── armor_demo_20s.mp4          # 20.0s · 1440×1080 · 30fps · H.264 Baseline（兼容性最好）
+│   ├── armor_demo_20s.mp4          # 20.0s · 1440×1080 · 30fps · H.264 Baseline
+│   └── armor_demo_20s.webm         # 同内容 VP9 预览版（本机播放器缺 H.264 解码器时用）
 ├── code/
 │   ├── lesson02_io.cpp             # 第二讲：/image_raw 订阅 + /vision_send_data 发布
-│   ├── lesson03_detection.cpp      # 第三讲：传统视觉装甲板检测
+│   ├── lesson03_detection.cpp      # 第三讲：装甲板检测 + 能量机关检测
+│   ├── lessons.hpp                 # 新增 Rune 结构与 lesson03_rune_detection 声明
 │   └── main.cpp                    # 主循环 + 检测框可视化 + 录制参数
 ├── patch/
 │   └── lesson03-armor-detection.patch   # 相对课程仓库的完整 diff
 ├── artifacts/
-│   ├── weights/{best.pt,last.pt}   # YOLOv8n，14 类
-│   ├── curves/                     # results、BoxPR/P/R/F1、混淆矩阵、labels
-│   ├── inference/                  # 验证集 48 张 + val_batch 推理图（均带类别与置信度）
-│   └── metrics.json                # 验证指标（整体 + 每类 mAP50）
-├── tools/                          # 训练、导出、演示驱动脚本
-└── docs/                           # 视频截图
+│   ├── weights/{best.pt,last.pt}        # 装甲板 YOLOv8n（14 类）
+│   ├── curves/                          # loss / mAP / PR / 混淆矩阵
+│   ├── inference/                       # 装甲检测可视化（48 张 val + val_batch）
+│   ├── metrics.json                     # 装甲模型验证指标
+│   └── rune/                            # 能量机关 YOLOv8n-pose
+│       ├── weights/{best.pt,last.pt}
+│       ├── curves/                      # Box/Pose 的 PR/F1/P/R + results
+│       └── inference/val_and_train/     # 30 张带关键点的推理图
+└── tools/                               # 训练、导出、演示驱动脚本
 ```
 
 ## 演示视频
 
-`demo/armor_demo_20s.mp4`（20.0 秒，≤20s 要求内）。
+`demo/armor_demo_20s.mp4` —— 20.0 秒，1440×1080，30fps，H.264 Constrained Baseline。
 
-录制流程：仿真器 + 训练程序运行后，用 X11 XTEST 向仿真窗口注入按键
-（`W/A/S/D` 平移底盘、`Q/E` 旋转底盘、`F5` 关闭订阅自瞄后方向键控云台），
-训练程序以 30fps 把带检测框的画面写入 mp4，裁掉启动阶段后保留 20 秒。
+画面里同时显示两种识别结果：
+
+- 绿色框：装甲板（`SMALL/LARGE + 置信度`）
+- 黄色框：能量机关（`RUNE + 置信度`）
+
+录制时小车主要做**前后移动**和小幅横移，转视角很少——云台只做了极小幅度调整，
+保证装甲板和能量机关始终在画面内。
+
+录制方式：仿真器 + 训练程序运行后，用 X11 XTEST 向仿真窗口注入按键
+（`W/S` 前后、`A/D` 横移），训练程序以 30fps 把带检测框的画面写入 mp4，
+裁掉启动阶段后保留 20 秒。
 
 ![演示截图](docs/demo_10s.png)
 
-## 第三讲实现要点（传统视觉）
+> 播放提示：本机播放器若提示缺 H.264 解码器（`gstreamer1.0-libav` 未安装），
+> 可直接打开同目录的 `armor_demo_20s.webm`，或用 `ffplay demo/armor_demo_20s.mp4`。
+
+## 第三讲实现要点
+
+### 装甲板（传统视觉）
 
 `code/lesson03_detection.cpp`
 
@@ -48,8 +66,16 @@ RoboMaster 校队二阶段培训考核的提交物：基于 `Exusiai-R/hnurmvisi
 6. **置信度**：高度一致 0.45 + 倾角一致 0.30 + 间距合理 0.25，阈值 0.55；
 7. **去重**：框 IoU > 0.45 的 NMS。
 
-`code/main.cpp` 负责画框（绿=小板、橙=大板，标注置信度）与可选录制；
-检测逻辑与显示分离，`Armor::corners` 顺序为左上、右上、右下、左下。
+### 能量机关（传统视觉）
+
+`lesson03_rune_detection()`，与装甲检测同一文件：
+
+1. 能量机关上有若干个**黄色圆形 R 标记**，按 H∈[18,40]、S≥120、V≥150 提取；
+2. 形态学闭运算后按**面积 80–20000 px² + 圆度 > 0.45 + 宽高比 0.5–2.0** 过滤；
+3. 取面积最大的一对标记，中心取中点，半径按标记间距的 **1.3 倍**估计，得到机关外接框；
+4. 置信度随可见标记数量增加（0.55 + 0.10×标记数，上限 0.95）。
+
+`code/main.cpp` 负责画框：装甲绿/橙，能量机关黄色，均带置信度。
 
 ## 接入课程仓库
 
@@ -66,66 +92,45 @@ git apply /path/to/patch/lesson03-armor-detection.patch
 
 ## 神经网络训练产物（老师提供的数据集）
 
-### 数据
+### 装甲板检测网络（14 类）
 
-来自老师下发的 `dataset.zip`（14 类 RoboMaster 装甲板）：
-
-- 原始 17996 张，筛出带 13 列标注的 7046 张，按 8:2 划分为 **train 5637 / val 1409**；
+- 数据：老师下发的 `dataset.zip`，17996 张筛出 7046 张带 13 列标注，train 5637 / val 1409；
 - 类别：`B1 B2 B3 B4 B5 BO BS R1 R2 R3 R4 R5 RO RS`；
-- 标注每行 13 列：`class cx cy w h x1 y1 x2 y2 x3 y3 x4 y4`（外接框 + 四角点，均归一化），
-  检测训练取前 5 列作为框，角点暂未使用。
+- 标注：`class cx cy w h x1 y1 x2 y2 x3 y3 x4 y4`，检测训练取前 5 列；
+- 模型：YOLOv8n，640×640，batch 16，35 epochs，RTX 4060 约 25 分钟；
+- 验证（1409 张 / 2362 实例）：**P 0.932，R 0.826，mAP50 0.902，mAP50-95 0.775**。
 
-### 训练
+每类 mAP50：B1 0.899、B2 0.832、B3 0.826、B4 0.895、B5 0.886、BO 0.988、BS 0.993、
+R1 0.850、R2 0.851、R3 0.879、R4 0.884、R5 0.897、RO 0.958、RS 0.989。
 
-- 模型：YOLOv8n（3.14M 参数，8.7 GFLOPs）
-- 640×640，batch 16，35 epochs，RTX 4060 Laptop 约 25 分钟
-- 命令：
+![装甲训练曲线](artifacts/curves/results.png)
+
+![装甲推理](artifacts/inference/val_batch0_pred.jpg)
+
+### 能量机关 Pose 网络
+
+- 数据：老师下发的 `能量机关数据集.zip`（YOLO Pose），train 620 / val 10（8 正 2 负）；
+- 标注：`class cx cy w h` + 5 个关键点（左、上、右、下、R 中心），`kpt_shape [5,2]`；
+- 模型：YOLOv8n-pose，640×640，40 epochs，RTX 4060 约 3 分钟；
+- 验证（10 张 / 9 目标，样本很小，指标波动大）：
+  **框 P 1.000 / R 1.000 / mAP50 0.995；关键点 mAP50 0.962 / mAP50-95 0.597**。
+
+![能量机关训练曲线](artifacts/rune/curves/results.png)
+
+![能量机关关键点推理](artifacts/rune/inference/val_and_train/141.png)
+
+### 复现
 
 ```bash
-python tools/train_teacher.py        # data.yaml 指向解压后的数据集
+python tools/train_teacher.py    # 装甲 14 类
+python tools/train_rune.py       # 能量机关 pose
 ```
-
-`data.yaml` 示例：
-
-```yaml
-path: /path/to/armor_teacher
-train: train/images
-val: val/images
-names: {0: B1, 1: B2, 2: B3, 3: B4, 4: B5, 5: BO, 6: BS,
-        7: R1, 8: R2, 9: R3, 10: R4, 11: R5, 12: RO, 13: RS}
-```
-
-### 验证结果（val 1409 张 / 2362 个实例）
-
-| 指标 | 数值 |
-|---|---|
-| Precision | 0.932 |
-| Recall | 0.826 |
-| mAP@50 | 0.902 |
-| mAP@50-95 | 0.775 |
-
-| 类别 | mAP50 | 类别 | mAP50 |
-|---|---|---|---|
-| B1 | 0.899 | R1 | 0.850 |
-| B2 | 0.832 | R2 | 0.851 |
-| B3 | 0.826 | R3 | 0.879 |
-| B4 | 0.895 | R4 | 0.884 |
-| B5 | 0.886 | R5 | 0.897 |
-| BO | 0.988 | RO | 0.958 |
-| BS | 0.993 | RS | 0.989 |
-
-![训练曲线](artifacts/curves/results.png)
-
-![验证集推理](artifacts/inference/val_batch0_pred.jpg)
-
-推理可视化见 `artifacts/inference/val/`（48 张，每张带类别与置信度），
-完整指标见 `artifacts/metrics.json`。
 
 ## 已知限制
 
-- 传统检测依赖灯条颜色/亮度阈值，强反光、完全遮挡、灯条 < 20px 时会漏检；
-- 检测网络与第三讲代码目前是并行交付：`lesson03_detection()` 走传统视觉，
-  网络产物独立提供。若要让检测框直接带编号，可把 `best.pt` 导出 ONNX，
-  在 `lesson03_detection()` 里接 `cv::dnn` 分支；
-- 网络只在老师数据集上训练/验证，部署到实车前建议补采现场光照数据做微调；
+- 传统检测依赖颜色/亮度阈值，强反光、遮挡、灯条或标记过小（< 20px）时会漏检；
+- 两个神经网络都在**老师提供的真实图像**上训练，直接拿到仿真器画面上用会有明显域差
+  （实测：装甲网络框错位、能量机关网络零检出），因此演示视频用的是传统检测器；
+  上实车前建议补采现场数据微调；
+- 能量机关只输出外接框（以及网络侧的 5 个关键点），没有做打击点/旋转预测；
 - 视频用程序内 `VideoWriter` 录制，画面只含相机窗口，不含仿真器界面。

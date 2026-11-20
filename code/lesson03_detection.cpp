@@ -234,3 +234,81 @@ std::vector<Armor> lesson03_detection(const cv::Mat& image) {
   return kept;
 }
 }  // namespace training
+
+namespace training {
+namespace {
+// 能量机关（能量装置）识别。
+//
+// 能量机关上有若干个黄色圆形 R 标记。按颜色 + 圆度把标记找出来，再用标记之间的
+// 距离估计机关中心与尺寸；机关整体远大于标记，所以框按标记间距的 2.6 倍扩张。
+struct RuneMark {
+  cv::Point2f center;
+  float size = 0;
+  double area = 0;
+};
+
+std::vector<RuneMark> findRuneMarks(const cv::Mat& image) {
+  cv::Mat hsv;
+  cv::cvtColor(image, hsv, cv::COLOR_BGR2HSV);
+
+  cv::Mat mask;
+  cv::inRange(hsv, cv::Scalar(18, 120, 150), cv::Scalar(40, 255, 255), mask);
+  const cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
+  cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernel);
+
+  std::vector<std::vector<cv::Point>> contours;
+  cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+  std::vector<RuneMark> marks;
+  for (const auto& contour : contours) {
+    const double area = cv::contourArea(contour);
+    if (area < 80.0 || area > 20000.0) continue;
+
+    const double perimeter = cv::arcLength(contour, true);
+    if (perimeter <= 1.0) continue;
+    const double circularity = 4.0 * kPi * area / (perimeter * perimeter);
+    if (circularity < 0.45) continue;
+
+    const cv::Rect box = cv::boundingRect(contour);
+    if (box.height <= 0 || box.width <= 0) continue;
+    const float aspect = static_cast<float>(box.width) / static_cast<float>(box.height);
+    if (aspect < 0.5F || aspect > 2.0F) continue;
+
+    RuneMark mark;
+    mark.center = cv::Point2f(box.x + box.width * 0.5F, box.y + box.height * 0.5F);
+    mark.size = static_cast<float>(std::max(box.width, box.height));
+    mark.area = area;
+    marks.push_back(mark);
+  }
+  return marks;
+}
+}  // namespace
+
+std::optional<Rune> lesson03_rune_detection(const cv::Mat& image) {
+  if (image.empty() || image.type() != CV_8UC3) return std::nullopt;
+
+  std::vector<RuneMark> marks = findRuneMarks(image);
+  if (marks.size() < 2) return std::nullopt;
+
+  // 取面积最大的一对：能量机关的标记比场地上的黄色装饰更大更圆。
+  std::sort(marks.begin(), marks.end(),
+            [](const RuneMark& a, const RuneMark& b) { return a.area > b.area; });
+  const RuneMark& first = marks[0];
+  const RuneMark& second = marks[1];
+
+  const cv::Point2f delta = second.center - first.center;
+  const float distance = static_cast<float>(cv::norm(delta));
+  if (distance < 20.0F) return std::nullopt;
+
+  const cv::Point2f center = (first.center + second.center) * 0.5F;
+  const float half = distance * 1.3F;  // 机关半径约为标记间距的 1.3 倍
+
+  Rune rune;
+  rune.corners[0] = {center.x - half, center.y - half};
+  rune.corners[1] = {center.x + half, center.y - half};
+  rune.corners[2] = {center.x + half, center.y + half};
+  rune.corners[3] = {center.x - half, center.y + half};
+  rune.confidence = std::min(0.95, 0.55 + 0.10 * static_cast<double>(std::min<std::size_t>(marks.size(), 4)));
+  return rune;
+}
+}  // namespace training
