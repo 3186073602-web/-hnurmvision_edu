@@ -631,10 +631,10 @@ index c9cbbd8..91958c8 100644
  }
  }  // namespace training
 diff --git a/lessons/lesson04_tracking.cpp b/lessons/lesson04_tracking.cpp
-index d0a03a2..d77e669 100644
+index d0a03a2..8872e2f 100644
 --- a/lessons/lesson04_tracking.cpp
 +++ b/lessons/lesson04_tracking.cpp
-@@ -1,28 +1,216 @@
+@@ -1,28 +1,229 @@
  #include "lessons.hpp"
  
 +#include <opencv2/calib3d.hpp>
@@ -683,6 +683,9 @@ index d0a03a2..d77e669 100644
 +constexpr double kMeasurementNoise = 1.5e-2 * 1.5e-2;
 +constexpr double kMaxSpeed = 4.0;
 +constexpr double kMaxAccel = 8.0;
++// 观测门限：镜头快速转动时，目标在云台系里会“瞬移”。超过这个距离就当作
++// 重新捕获，清空速度/加速度，避免滤波器把这次跳变当成真实速度。
++constexpr double kMeasurementGate = 0.8;
 +
 +// 单轴常加速度卡尔曼一步预测 + 更新。
 +void kalmanStep(double measurement, double dt, double& position, double& velocity,
@@ -825,7 +828,17 @@ index d0a03a2..d77e669 100644
 +      std::chrono::duration<double>(timestamp.time_since_epoch()).count();
 +  if (state.valid && state.last_time_sec > 0.0) {
 +    const double dt_pair = now_sec - state.last_time_sec;
-+    if (dt_pair > 1e-3 && dt_pair < kMaxTrackGap) {
++    const Eigen::Vector3d innovation = best_position - (state.position + state.velocity * dt_pair);
++    if (innovation.norm() > kMeasurementGate) {
++      velocity.setZero();
++      acceleration.setZero();
++      for (auto& covariance : state.covariance) {
++        covariance = Eigen::Matrix3d::Zero();
++        covariance(0, 0) = 1.0;
++        covariance(1, 1) = 10.0;
++        covariance(2, 2) = 10.0;
++      }
++    } else if (dt_pair > 1e-3 && dt_pair < kMaxTrackGap) {
 +      position = state.position;
 +      velocity = state.velocity;
 +      acceleration = state.acceleration;
