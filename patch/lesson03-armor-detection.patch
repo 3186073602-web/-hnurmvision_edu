@@ -1,3 +1,20 @@
+diff --git a/configs/simulation.yaml b/configs/simulation.yaml
+index ae82170..7d0f06a 100644
+--- a/configs/simulation.yaml
++++ b/configs/simulation.yaml
+@@ -10,7 +10,9 @@ distort_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
+ 
+ # 相机光学坐标系到云台坐标系：p_gimbal = R * p_camera + t。
+ # vehicle.glb 中相机/枪口固定仰角为 25°。
+-R_camera2gimbal: [0.0, 0.4226182617, 0.9063077870,
++# 以仿真器 /tf 的 gimbal_link -> camera_link -> camera_optical_frame 为准
++# （旧值含 25° 俯仰，与当前仿真不一致，会让 PnP 结果整体偏高约 0.9 m）。
++R_camera2gimbal: [0.0, 0.0, 1.0,
+                   -1.0, 0.0, 0.0,
+-                  0.0, -0.9063077870, 0.4226182617]
+-t_camera2gimbal: [0.0, 0.0, 0.0]
++                  0.0, -1.0, 0.0]
++t_camera2gimbal: [0.060, 0.002, 0.196]
 diff --git a/include/lessons.hpp b/include/lessons.hpp
 index 86fa46e..c990391 100644
 --- a/include/lessons.hpp
@@ -16,22 +33,51 @@ index 86fa46e..c990391 100644
  std::optional<Target> lesson04_tracking(const std::vector<Armor>& armors,
      TimePoint timestamp, const Eigen::Quaterniond& imu_q, const CameraCalibration& calibration, TrackingState& state);
  Command lesson05_aiming(const Target& target, TimePoint timestamp, double bullet_speed);
+diff --git a/include/tracking_state.hpp b/include/tracking_state.hpp
+index 3f3cc22..f85a499 100644
+--- a/include/tracking_state.hpp
++++ b/include/tracking_state.hpp
+@@ -1,8 +1,17 @@
+ #pragma once
++#include <Eigen/Geometry>
++#include <optional>
+ 
+ namespace training {
+ // 仅第四讲使用；由学员设计跨帧状态，其余讲不接收它。
++//
++// 基础跟踪的状态：上一帧的观测（世界系位置、时间、像素中心）与差分得到的
++// 速度估计。帧间丢失时保留上一帧位置，超过 kMaxTrackGap 秒未更新则失效。
+ struct TrackingState {
+-  // TODO(第四讲)：定义跟踪所需的状态。
++  bool valid = false;
++  Eigen::Vector3d position = Eigen::Vector3d::Zero();  // m，世界系
++  Eigen::Vector3d velocity = Eigen::Vector3d::Zero();  // m/s，世界系
++  double last_time_sec = 0.0;
++  double last_distance = 0.0;                          // m，PnP 距离，用于选板
+ };
+ }  // namespace training
 diff --git a/lessons/lesson02_io.cpp b/lessons/lesson02_io.cpp
-index a7f8efc..9ac773f 100644
+index a7f8efc..182496d 100644
 --- a/lessons/lesson02_io.cpp
 +++ b/lessons/lesson02_io.cpp
-@@ -1,20 +1,147 @@
+@@ -1,20 +1,204 @@
  #include "io_context.hpp"
 +
++#include "vision_gt.hpp"
++
 +#include <hnurm_interfaces/msg/vision_send_data.hpp>
++#include <tf2_msgs/msg/tf_message.hpp>
 +#include <opencv2/imgproc.hpp>
 +#include <rclcpp/rclcpp.hpp>
 +#include <sensor_msgs/msg/image.hpp>
 +
  #include <chrono>
++#include <cstdio>
++#include <map>
 +#include <memory>
 +#include <mutex>
 +#include <optional>
++#include <string>
  #include <thread>
  
  namespace training::io {
@@ -46,17 +92,44 @@ index a7f8efc..9ac773f 100644
 +struct Bridge {
 +  std::shared_ptr<rclcpp::Node> node;
 +  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_subscription;
++  rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr tf_subscription;
 +  rclcpp::Publisher<hnurm_interfaces::msg::VisionSendData>::SharedPtr command_publisher;
 +  std::mutex mutex;
 +  cv::Mat latest_image;          // 最近一帧 BGR 图像
 +  TimePoint latest_stamp{};      // 收到该帧时的本机时刻
 +  bool has_image = false;
 +  bool started = false;
++
++  // /tf 里 map 系下的装甲板中心与云台位姿，用于第四讲的真值对比。
++  std::map<std::string, Eigen::Vector3d> armor_positions;
++  Eigen::Vector3d gimbal_position = Eigen::Vector3d::Zero();
++  Eigen::Quaterniond gimbal_rotation = Eigen::Quaterniond::Identity();
++  bool has_gimbal = false;
 +};
 +
 +Bridge& bridge() {
 +  static Bridge instance;
 +  return instance;
++}
++
++void onTf(const tf2_msgs::msg::TFMessage::SharedPtr msg) {
++  Bridge& b = bridge();
++  std::lock_guard<std::mutex> lock(b.mutex);
++  for (const auto& tf : msg->transforms) {
++    const std::string& child = tf.child_frame_id;
++    const auto& t = tf.transform.translation;
++    const auto& q = tf.transform.rotation;
++    if (child == "odom") {
++      // map -> odom：云台在 map 系中的平移就是这里记录的平移。
++      b.gimbal_position = Eigen::Vector3d(t.x, t.y, t.z);
++    } else if (child == "gimbal_link") {
++      // odom -> gimbal_link：平移为零，旋转为云台姿态。
++      b.gimbal_rotation = Eigen::Quaterniond(q.w, q.x, q.y, q.z);
++      b.has_gimbal = true;
++    } else if (child.rfind("armor_", 0) == 0) {
++      b.armor_positions[child] = Eigen::Vector3d(t.x, t.y, t.z);
++    }
++  }
 +}
 +
 +void onImage(const sensor_msgs::msg::Image::SharedPtr msg) {
@@ -84,6 +157,26 @@ index a7f8efc..9ac773f 100644
 +
 +}  // namespace
 +
++std::optional<Eigen::Vector3d> nearestArmorInGimbal(const Eigen::Vector3d& hint) {
++  Bridge& b = bridge();
++  std::lock_guard<std::mutex> lock(b.mutex);
++  if (!b.has_gimbal || b.armor_positions.empty()) return std::nullopt;
++
++  std::optional<Eigen::Vector3d> best;
++  double best_error = 0.0;
++  for (const auto& [name, world] : b.armor_positions) {
++    (void)name;
++    const Eigen::Vector3d relative = b.gimbal_rotation.inverse() * (world - b.gimbal_position);
++    const double error = (relative - hint).norm();
++    if (!best || error < best_error) {
++      best = relative;
++      best_error = error;
++    }
++  }
++  if (best_error > 1.0) return std::nullopt;  // 最近的板子也差 1m 以上，认为没对上
++  return best;
++}
++
  void IoContext::open() {
 +  Bridge& b = bridge();
 +  if (b.started) return;
@@ -98,6 +191,10 @@ index a7f8efc..9ac773f 100644
 +  b.image_subscription = b.node->create_subscription<sensor_msgs::msg::Image>(
 +      "/image_raw", rclcpp::QoS(10),
 +      [](const sensor_msgs::msg::Image::SharedPtr msg) { onImage(msg); });
++
++  b.tf_subscription = b.node->create_subscription<tf2_msgs::msg::TFMessage>(
++      "/tf", rclcpp::QoS(100),
++      [](const tf2_msgs::msg::TFMessage::SharedPtr msg) { onTf(msg); });
 +
 +  b.command_publisher =
 +      b.node->create_publisher<hnurm_interfaces::msg::VisionSendData>(
@@ -172,10 +269,10 @@ index a7f8efc..9ac773f 100644
  }
  }  // namespace training::io
 diff --git a/lessons/lesson03_detection.cpp b/lessons/lesson03_detection.cpp
-index c9cbbd8..ff24bed 100644
+index c9cbbd8..ad4202c 100644
 --- a/lessons/lesson03_detection.cpp
 +++ b/lessons/lesson03_detection.cpp
-@@ -1,13 +1,347 @@
+@@ -1,13 +1,330 @@
  #include "lessons.hpp"
  
 +#include <opencv2/imgproc.hpp>
@@ -220,7 +317,7 @@ index c9cbbd8..ff24bed 100644
 +constexpr float kMinArmorAspect = 1.60F;  // 装甲板外接框 宽/高
 +constexpr float kMaxArmorAspect = 5.00F;
 +constexpr float kLargeArmorAspect = 2.85F; // 超过即视为大装甲板（哨兵）
-+constexpr float kMinConfidence = 0.55F;
++constexpr float kMinConfidence = 0.62F;
 +constexpr float kSuppressIou = 0.45F;
 +
 +struct LightBar {
@@ -305,24 +402,6 @@ index c9cbbd8..ff24bed 100644
 +  corners[2] = {right.bottom.x + right.width * 0.5F, right.bottom.y};
 +  corners[3] = {left.bottom.x - left.width * 0.5F, left.bottom.y};
 +  return corners;
-+}
-+
-+// 灯条只占装甲板两侧的一部分：上下各有约 1/4 板高的边框，左右也略宽。
-+// 检测框按灯条外沿算出后，再围绕中心放大到整块板的范围。
-+constexpr float kPlateWiden = 1.35F;
-+constexpr float kPlateTall = 2.05F;
-+
-+std::array<cv::Point2f, 4> expandToPlate(const std::array<cv::Point2f, 4>& corners,
-+                                         float widen, float tall) {
-+  cv::Point2f center{0.0F, 0.0F};
-+  for (const auto& p : corners) center += p;
-+  center *= 0.25F;
-+  std::array<cv::Point2f, 4> out{};
-+  for (std::size_t i = 0; i < 4; ++i) {
-+    out[i] = {center.x + (corners[i].x - center.x) * widen,
-+              center.y + (corners[i].y - center.y) * tall};
-+  }
-+  return out;
 +}
 +
 +float quadWidth(const std::array<cv::Point2f, 4>& c) {
@@ -418,8 +497,9 @@ index c9cbbd8..ff24bed 100644
 +      if (confidence < kMinConfidence) continue;
 +
 +      Armor armor;
-+      // 角点放大到整块装甲板（大小板判定仍用灯条外沿的宽高比）。
-+      armor.corners = expandToPlate(corners, kPlateWiden, kPlateTall);
++      // 角点保持灯条外沿（≈ 真实板 135×55 mm），PnP 依赖这个物理尺寸；
++      // 显示时再外扩，见 main.cpp 的 drawArmors。
++      armor.corners = corners;
 +      armor.large_armor = aspect > kLargeArmorAspect;
 +      armor.class_id = -1;  // 本讲不做数字识别，无法读取编号
 +      armor.confidence = std::min(0.99F, std::max(0.0F, confidence));
@@ -530,15 +610,165 @@ index c9cbbd8..ff24bed 100644
 +  return runes;
  }
  }  // namespace training
+diff --git a/lessons/lesson04_tracking.cpp b/lessons/lesson04_tracking.cpp
+index d0a03a2..45f232b 100644
+--- a/lessons/lesson04_tracking.cpp
++++ b/lessons/lesson04_tracking.cpp
+@@ -1,28 +1,122 @@
+ #include "lessons.hpp"
+ 
++#include <opencv2/calib3d.hpp>
++
++#include <algorithm>
++#include <cmath>
++#include <vector>
++
+ namespace training {
+-// 第四讲：位姿、坐标与基础跟踪
+-//
+-// 输入格式：
+-//   armors     : const std::vector<Armor>&，第三讲输出的本帧装甲板观测。
+-//   timestamp  : TimePoint，本帧图像时刻；只能与其他 TimePoint 求时间差。
+-//   imu_q      : const Eigen::Quaterniond&，图像时刻的归一化姿态四元数。
+-//   calibration: const CameraCalibration&：
+-//                matrix=3x3 CV_64F 相机内参；distortion=1x5 CV_64F 畸变；
+-//                camera_to_gimbal=相机到云台的 3x3 旋转矩阵；
+-//                camera_to_gimbal_translation=相机到云台平移，单位 m。
+-//   state      : TrackingState&，仅本讲使用的跨帧状态；函数需要原地更新。
+-// 输出格式：
+-//   std::optional<Target>。有目标时：
+-//   - position : IMU 稳定参考系中、相对云台原点的目标向量，单位 m；
+-//   - velocity : 同一参考坐标系中的目标速度，单位 m/s。
+-//   本课程统一使用 x 向前、y 向左、z 向上的右手坐标系。
+-//   无有效观测、PnP 失败或跟踪未建立时返回 std::nullopt。
++namespace {
++
++// 装甲板物理尺寸（米）。小板 135×55 mm，大板（哨兵）225×55 mm。
++// 第三讲的角点已经外扩到整块板，所以直接用板的外沿尺寸。
++constexpr double kSmallHalfWidth = 0.0675;
++constexpr double kLargeHalfWidth = 0.1125;
++constexpr double kHalfHeight = 0.0275;
++
++// 超过这个时间还没更新，就认为目标丢失，速度清零。
++constexpr double kMaxTrackGap = 0.5;
++
++std::vector<cv::Point3f> armorObjectPoints(bool large) {
++  const double hw = large ? kLargeHalfWidth : kSmallHalfWidth;
++  const double hh = kHalfHeight;
++  // 与图像角点顺序一致：左上、右上、右下、左下（y 向下为正）。
++  return {
++      {static_cast<float>(-hw), static_cast<float>(-hh), 0.0F},
++      {static_cast<float>(hw), static_cast<float>(-hh), 0.0F},
++      {static_cast<float>(hw), static_cast<float>(hh), 0.0F},
++      {static_cast<float>(-hw), static_cast<float>(hh), 0.0F},
++  };
++}
++
++double secondsBetween(TimePoint a, TimePoint b) {
++  return std::chrono::duration<double>(a - b).count();
++}
++
++// 单块装甲板的 PnP：返回相机系下的平移（板中心）。
++bool solveArmorPose(const Armor& armor, const CameraCalibration& calibration,
++                    Eigen::Vector3d& camera_xyz) {
++  if (!calibration.valid()) return false;
++  std::vector<cv::Point2f> image_points(armor.corners.begin(), armor.corners.end());
++  cv::Vec3d rvec, tvec;
++  try {
++    // IPPE 专门用于平面四点，比迭代法稳定，且不需要初值。
++    if (!cv::solvePnP(armorObjectPoints(armor.large_armor), image_points,
++                      calibration.matrix, calibration.distortion, rvec, tvec, false,
++                      cv::SOLVEPNP_IPPE)) {
++      return false;
++    }
++  } catch (const cv::Exception&) {
++    return false;
++  }
++  if (tvec[2] <= 0.0) return false;  // 板子在相机后面，丢弃
++  camera_xyz = Eigen::Vector3d(tvec[0], tvec[1], tvec[2]);
++  return true;
++}
++
++}  // namespace
++
+ std::optional<Target> lesson04_tracking(const std::vector<Armor>& armors,
+-    TimePoint timestamp, const Eigen::Quaterniond& imu_q, const CameraCalibration& calibration, TrackingState& state) {
++    TimePoint timestamp, const Eigen::Quaterniond& imu_q,
++    const CameraCalibration& calibration, TrackingState& state) {
+   // ===== 实现区 BEGIN =====
+-  (void)armors; (void)timestamp; (void)imu_q; (void)calibration; (void)state;
+-  return std::nullopt;
++  if (armors.empty()) {
++    state.valid = false;
++    return std::nullopt;
++  }
++
++  // 选板：逐块解 PnP，取离云台最近的一块。仿真里同一时刻只有一块可见，
++  // 实车多目标时这里可以换成“威胁优先（编号/血量）+ 距离”的策略。
++  bool found = false;
++  Eigen::Vector3d best_position = Eigen::Vector3d::Zero();
++  double best_distance = 0.0;
++
++  for (const auto& armor : armors) {
++    Eigen::Vector3d camera_xyz;
++    if (!solveArmorPose(armor, calibration, camera_xyz)) continue;
++
++    // 相机系 → 云台系 → 世界系（IMU 稳定系）。
++    const Eigen::Vector3d gimbal_xyz =
++        calibration.camera_to_gimbal * camera_xyz + calibration.camera_to_gimbal_translation;
++    const Eigen::Vector3d world_xyz = imu_q * gimbal_xyz;
++
++    const double distance = world_xyz.norm();
++    if (!found || distance < best_distance) {
++      found = true;
++      best_distance = distance;
++      best_position = world_xyz;
++    }
++  }
++
++  if (!found) {
++    state.valid = false;
++    return std::nullopt;
++  }
++
++  // 匀速模型：相邻两帧差分估计速度；丢帧太久或时间间隔异常时清零。
++  Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
++  const double now_sec =
++      std::chrono::duration<double>(timestamp.time_since_epoch()).count();
++  if (state.valid && state.last_time_sec > 0.0) {
++    const double dt_pair = now_sec - state.last_time_sec;
++    if (dt_pair > 1e-3 && dt_pair < kMaxTrackGap) {
++      // 差分速度抖动大，做一阶低通（新值权重 0.5），预测框才不会来回跳。
++      const Eigen::Vector3d measured = (best_position - state.position) / dt_pair;
++      velocity = state.velocity * 0.5 + measured * 0.5;
++    }
++  }
++
++  state.valid = true;
++  state.position = best_position;
++  state.velocity = velocity;
++  state.last_time_sec = now_sec;
++  state.last_distance = best_distance;
++
++  Target target;
++  target.position = best_position;
++  target.velocity = velocity;
++  return target;
+   // ===== 实现区 END =====
+ }
+ }  // namespace training
 diff --git a/src/main.cpp b/src/main.cpp
-index 4a7bf8c..f398e39 100644
+index 4a7bf8c..0d5e9aa 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
-@@ -1,13 +1,79 @@
+@@ -1,13 +1,106 @@
  #include "lessons.hpp"
  #include "io_context.hpp"
++#include "vision_gt.hpp"
  #include <opencv2/highgui.hpp>
 +#include <opencv2/imgproc.hpp>
++#include <deque>
++#include <optional>
  #include <csignal>
 +#include <algorithm>
 +#include <cstdio>
@@ -550,6 +780,23 @@ index 4a7bf8c..f398e39 100644
 +
 +// 把第三讲的检测结果画到显示画面上。检测本身在 lesson03_detection 里完成，
 +// 这里只负责可视化：角点顺序为左上、右上、右下、左下，与 types.hpp 的约定一致。
++// 把世界系（IMU 稳定系）下的点投影回图像：世界→云台→相机→像素。
++std::optional<cv::Point2f> projectWorld(const Eigen::Vector3d& world,
++                                        const Eigen::Quaterniond& imu_q,
++                                        const training::CameraCalibration& calibration) {
++  if (!calibration.valid()) return std::nullopt;
++  const Eigen::Vector3d gimbal = imu_q.inverse() * world;
++  const Eigen::Vector3d camera =
++      calibration.camera_to_gimbal.transpose() * (gimbal - calibration.camera_to_gimbal_translation);
++  if (camera.z() <= 1e-3) return std::nullopt;
++  const double fx = calibration.matrix.at<double>(0, 0);
++  const double fy = calibration.matrix.at<double>(1, 1);
++  const double cx = calibration.matrix.at<double>(0, 2);
++  const double cy = calibration.matrix.at<double>(1, 2);
++  return cv::Point2f(static_cast<float>(fx * camera.x() / camera.z() + cx),
++                     static_cast<float>(fy * camera.y() / camera.z() + cy));
++}
++
 +void drawRune(cv::Mat& frame, const training::Rune& rune) {
 +  cv::Point polygon[4];
 +  for (int i = 0; i < 4; ++i) {
@@ -565,14 +812,21 @@ index 4a7bf8c..f398e39 100644
  }
  
 +void drawArmors(cv::Mat& frame, const std::vector<training::Armor>& armors) {
++  // 只影响显示：检测角点是灯条外沿（P nP 用的物理尺寸），画框时外扩到整块板。
++  constexpr float kWiden = 1.35F;
++  constexpr float kTall = 2.05F;
 +  for (const auto& armor : armors) {
++    cv::Point2f center(0, 0);
++    for (const auto& corner : armor.corners) center += corner;
++    center *= 0.25F;
++
 +    // corners 是 Point2f，必须逐个取整，不能把 float 直接按 int 重解释。
-+    const cv::Point polygon[4] = {
-+        cv::Point(cvRound(armor.corners[0].x), cvRound(armor.corners[0].y)),
-+        cv::Point(cvRound(armor.corners[1].x), cvRound(armor.corners[1].y)),
-+        cv::Point(cvRound(armor.corners[2].x), cvRound(armor.corners[2].y)),
-+        cv::Point(cvRound(armor.corners[3].x), cvRound(armor.corners[3].y)),
-+    };
++    cv::Point polygon[4];
++    for (int i = 0; i < 4; ++i) {
++      const cv::Point2f p(center.x + (armor.corners[i].x - center.x) * kWiden,
++                          center.y + (armor.corners[i].y - center.y) * kTall);
++      polygon[i] = cv::Point(cvRound(p.x), cvRound(p.y));
++    }
 +
 +    // 大小板用不同颜色区分：绿色 = 小装甲板，橙色 = 大装甲板（哨兵）。
 +    const cv::Scalar color = armor.large_armor ? cv::Scalar(0, 165, 255)
@@ -614,7 +868,7 @@ index 4a7bf8c..f398e39 100644
  int main(int argc, char** argv) {
    std::signal(SIGINT, on_signal);
    std::signal(SIGTERM, on_signal);
-@@ -17,11 +83,34 @@ int main(int argc, char** argv) {
+@@ -17,21 +110,125 @@ int main(int argc, char** argv) {
    training::TrackingState tracking;
    devices.open();
  
@@ -650,7 +904,83 @@ index 4a7bf8c..f398e39 100644
        const auto target = training::lesson04_tracking(
            armors, input->timestamp, input->imu_q, calibration, tracking);
        if (target)
-@@ -31,7 +120,14 @@ int main(int argc, char** argv) {
+         command = training::lesson05_aiming(*target, input->timestamp, input->bullet_speed);
++
++      // 第四讲可视化：PnP 位姿 vs 仿真真值；预测 250ms 后的位置并统计误差。
++      static std::deque<std::pair<double, Eigen::Vector3d>> predictions;
++      static double last_pred_error = 0.0;
++      static bool has_pred_error = false;
++      static double last_pose_error = 0.0;
++      static bool has_pose_error = false;
++      const double now_sec =
++          std::chrono::duration<double>(input->timestamp.time_since_epoch()).count();
++      constexpr double kPredictAhead = 0.25;  // 250 ms
++
++      if (target) {
++        // 真值：/tf 中离 PnP 结果最近的装甲板中心（云台系）。
++        // 位姿误差只在近似静止时显示：靶车在动时真值关联和框抖动都会放大误差。
++        if (target->velocity.norm() < 0.2) {
++          if (const auto gt = training::io::nearestArmorInGimbal(target->position)) {
++            last_pose_error = (target->position - *gt).norm();
++            has_pose_error = true;
++          }
++        } else {
++          has_pose_error = false;
++        }
++
++        const Eigen::Vector3d predicted = target->position + target->velocity * kPredictAhead;
++        predictions.emplace_back(now_sec, predicted);
++
++        // 画 250ms 后的预测框（青色）：预测点投回图像，框按距离缩放。
++        if (!armors.empty()) {
++          if (const auto predicted_px = projectWorld(predicted, input->imu_q, calibration)) {
++            const cv::Rect2f box = cv::boundingRect(armors.front().corners);
++            const double current_z = target->position.norm();
++            const double predicted_z = predicted.norm();
++            const float scale = predicted_z > 1e-3
++                ? static_cast<float>(current_z / predicted_z) : 1.0F;
++            const cv::Size2f size(box.width * scale, box.height * scale);
++            const cv::Rect2f rect(predicted_px->x - size.width * 0.5F,
++                                  predicted_px->y - size.height * 0.5F,
++                                  size.width, size.height);
++            cv::rectangle(input->image, rect, cv::Scalar(255, 200, 0), 2, cv::LINE_AA);
++            cv::putText(input->image, "PRED 250ms",
++                        cv::Point(static_cast<int>(rect.x), static_cast<int>(rect.y) - 6),
++                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 200, 0), 1, cv::LINE_AA);
++          }
++        }
++
++        // 250ms 后：预测位置与该时刻实际观测到的目标位置比较，误差显示在左下角。
++        while (!predictions.empty() && now_sec - predictions.front().first >= kPredictAhead) {
++          const Eigen::Vector3d predicted_at = predictions.front().second;
++          predictions.pop_front();
++          last_pred_error = (predicted_at - target->position).norm();
++          has_pred_error = true;
++        }
++      }
++
++      if (devices.config.display) {
++        char line[128];
++        if (target) {
++          std::snprintf(line, sizeof(line), "PnP dist: %.2f m", target->position.norm());
++        } else {
++          std::snprintf(line, sizeof(line), "PnP dist: --");
++        }
++        cv::putText(input->image, line, cv::Point(24, 106), cv::FONT_HERSHEY_SIMPLEX,
++                    0.7, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
++        if (has_pose_error) {
++          std::snprintf(line, sizeof(line), "static pose err vs GT: %.1f cm", last_pose_error * 100.0);
++          cv::putText(input->image, line, cv::Point(24, 140), cv::FONT_HERSHEY_SIMPLEX,
++                      0.7, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
++        }
++        if (has_pred_error) {
++          std::snprintf(line, sizeof(line), "pred error @250ms: %.1f cm", last_pred_error * 100.0);
++          cv::putText(input->image, line, cv::Point(24, input->image.rows - 24),
++                      cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
++        }
++      }
+     }
+     if (interrupted) break;
      devices.write(command);
  
      if (input && devices.config.display) {

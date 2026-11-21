@@ -38,7 +38,7 @@ constexpr float kMaxGapRatio = 4.50F;
 constexpr float kMinArmorAspect = 1.60F;  // 装甲板外接框 宽/高
 constexpr float kMaxArmorAspect = 5.00F;
 constexpr float kLargeArmorAspect = 2.85F; // 超过即视为大装甲板（哨兵）
-constexpr float kMinConfidence = 0.55F;
+constexpr float kMinConfidence = 0.62F;
 constexpr float kSuppressIou = 0.45F;
 
 struct LightBar {
@@ -123,24 +123,6 @@ std::array<cv::Point2f, 4> makeCorners(const LightBar& left, const LightBar& rig
   corners[2] = {right.bottom.x + right.width * 0.5F, right.bottom.y};
   corners[3] = {left.bottom.x - left.width * 0.5F, left.bottom.y};
   return corners;
-}
-
-// 灯条只占装甲板两侧的一部分：上下各有约 1/4 板高的边框，左右也略宽。
-// 检测框按灯条外沿算出后，再围绕中心放大到整块板的范围。
-constexpr float kPlateWiden = 1.35F;
-constexpr float kPlateTall = 2.05F;
-
-std::array<cv::Point2f, 4> expandToPlate(const std::array<cv::Point2f, 4>& corners,
-                                         float widen, float tall) {
-  cv::Point2f center{0.0F, 0.0F};
-  for (const auto& p : corners) center += p;
-  center *= 0.25F;
-  std::array<cv::Point2f, 4> out{};
-  for (std::size_t i = 0; i < 4; ++i) {
-    out[i] = {center.x + (corners[i].x - center.x) * widen,
-              center.y + (corners[i].y - center.y) * tall};
-  }
-  return out;
 }
 
 float quadWidth(const std::array<cv::Point2f, 4>& c) {
@@ -233,8 +215,9 @@ std::vector<Armor> lesson03_detection(const cv::Mat& image) {
       if (confidence < kMinConfidence) continue;
 
       Armor armor;
-      // 角点放大到整块装甲板（大小板判定仍用灯条外沿的宽高比）。
-      armor.corners = expandToPlate(corners, kPlateWiden, kPlateTall);
+      // 角点保持灯条外沿（≈ 真实板 135×55 mm），PnP 依赖这个物理尺寸；
+      // 显示时再外扩，见 main.cpp 的 drawArmors。
+      armor.corners = corners;
       armor.large_armor = aspect > kLargeArmorAspect;
       armor.class_id = -1;  // 本讲不做数字识别，无法读取编号
       armor.confidence = std::min(0.99F, std::max(0.0F, confidence));

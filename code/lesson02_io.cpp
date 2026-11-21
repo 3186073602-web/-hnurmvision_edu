@@ -1,14 +1,20 @@
 #include "io_context.hpp"
 
+#include "vision_gt.hpp"
+
 #include <hnurm_interfaces/msg/vision_send_data.hpp>
+#include <tf2_msgs/msg/tf_message.hpp>
 #include <opencv2/imgproc.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 
 #include <chrono>
+#include <cstdio>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <thread>
 
 namespace training::io {
@@ -23,17 +29,44 @@ namespace {
 struct Bridge {
   std::shared_ptr<rclcpp::Node> node;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_subscription;
+  rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr tf_subscription;
   rclcpp::Publisher<hnurm_interfaces::msg::VisionSendData>::SharedPtr command_publisher;
   std::mutex mutex;
   cv::Mat latest_image;          // 最近一帧 BGR 图像
   TimePoint latest_stamp{};      // 收到该帧时的本机时刻
   bool has_image = false;
   bool started = false;
+
+  // /tf 里 map 系下的装甲板中心与云台位姿，用于第四讲的真值对比。
+  std::map<std::string, Eigen::Vector3d> armor_positions;
+  Eigen::Vector3d gimbal_position = Eigen::Vector3d::Zero();
+  Eigen::Quaterniond gimbal_rotation = Eigen::Quaterniond::Identity();
+  bool has_gimbal = false;
 };
 
 Bridge& bridge() {
   static Bridge instance;
   return instance;
+}
+
+void onTf(const tf2_msgs::msg::TFMessage::SharedPtr msg) {
+  Bridge& b = bridge();
+  std::lock_guard<std::mutex> lock(b.mutex);
+  for (const auto& tf : msg->transforms) {
+    const std::string& child = tf.child_frame_id;
+    const auto& t = tf.transform.translation;
+    const auto& q = tf.transform.rotation;
+    if (child == "odom") {
+      // map -> odom：云台在 map 系中的平移就是这里记录的平移。
+      b.gimbal_position = Eigen::Vector3d(t.x, t.y, t.z);
+    } else if (child == "gimbal_link") {
+      // odom -> gimbal_link：平移为零，旋转为云台姿态。
+      b.gimbal_rotation = Eigen::Quaterniond(q.w, q.x, q.y, q.z);
+      b.has_gimbal = true;
+    } else if (child.rfind("armor_", 0) == 0) {
+      b.armor_positions[child] = Eigen::Vector3d(t.x, t.y, t.z);
+    }
+  }
 }
 
 void onImage(const sensor_msgs::msg::Image::SharedPtr msg) {
@@ -61,6 +94,26 @@ void onImage(const sensor_msgs::msg::Image::SharedPtr msg) {
 
 }  // namespace
 
+std::optional<Eigen::Vector3d> nearestArmorInGimbal(const Eigen::Vector3d& hint) {
+  Bridge& b = bridge();
+  std::lock_guard<std::mutex> lock(b.mutex);
+  if (!b.has_gimbal || b.armor_positions.empty()) return std::nullopt;
+
+  std::optional<Eigen::Vector3d> best;
+  double best_error = 0.0;
+  for (const auto& [name, world] : b.armor_positions) {
+    (void)name;
+    const Eigen::Vector3d relative = b.gimbal_rotation.inverse() * (world - b.gimbal_position);
+    const double error = (relative - hint).norm();
+    if (!best || error < best_error) {
+      best = relative;
+      best_error = error;
+    }
+  }
+  if (best_error > 1.0) return std::nullopt;  // 最近的板子也差 1m 以上，认为没对上
+  return best;
+}
+
 void IoContext::open() {
   Bridge& b = bridge();
   if (b.started) return;
@@ -75,6 +128,10 @@ void IoContext::open() {
   b.image_subscription = b.node->create_subscription<sensor_msgs::msg::Image>(
       "/image_raw", rclcpp::QoS(10),
       [](const sensor_msgs::msg::Image::SharedPtr msg) { onImage(msg); });
+
+  b.tf_subscription = b.node->create_subscription<tf2_msgs::msg::TFMessage>(
+      "/tf", rclcpp::QoS(100),
+      [](const tf2_msgs::msg::TFMessage::SharedPtr msg) { onTf(msg); });
 
   b.command_publisher =
       b.node->create_publisher<hnurm_interfaces::msg::VisionSendData>(

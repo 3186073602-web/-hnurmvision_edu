@@ -12,10 +12,12 @@ RoboMaster 校队二阶段培训考核的提交物：基于 `Exusiai-R/hnurmvisi
 │   ├── armor_demo_20s.mp4          # 20.0s · 1440×1080 · 30fps · H.264 Baseline
 │   └── armor_demo_20s.webm         # 同内容 VP9 预览版（本机播放器缺 H.264 解码器时用）
 ├── code/
-│   ├── lesson02_io.cpp             # 第二讲：/image_raw 订阅 + /vision_send_data 发布
+│   ├── lesson02_io.cpp             # 第二讲 IO + /tf 真值订阅
 │   ├── lesson03_detection.cpp      # 第三讲：装甲板检测 + 能量机关检测
-│   ├── lessons.hpp                 # 新增 Rune 结构与 lesson03_rune_detection 声明
-│   └── main.cpp                    # 主循环 + 检测框可视化 + 录制参数
+│   ├── lesson04_tracking.cpp       # 第四讲：PnP 位姿 + 匀速模型跟踪
+│   ├── lessons.hpp / tracking_state.hpp / vision_gt.hpp
+│   ├── configs/simulation.yaml     # 修正后的相机→云台标定
+│   └── main.cpp                    # 主循环 + 预测框/误差可视化 + 录制参数
 ├── patch/
 │   └── lesson03-armor-detection.patch   # 相对课程仓库的完整 diff
 ├── artifacts/
@@ -81,6 +83,41 @@ RoboMaster 校队二阶段培训考核的提交物：基于 `Exusiai-R/hnurmvisi
 4. 置信度由圆度决定（0.55 + 0.45×圆度，上限 0.99）。
 
 `code/main.cpp` 负责画框：装甲绿/橙，能量机关黄色，均带置信度。
+
+## 第四讲：PnP 位姿与基础跟踪
+
+`code/lesson04_tracking.cpp`
+
+1. **PnP 解算**：按板型取物理尺寸（小板 135×55 mm、大板 225×55 mm）构造四个物点，
+   用 `cv::solvePnP(..., SOLVEPNP_IPPE)` 解出 `rvec/tvec`；
+2. **坐标变换**：相机系 → 云台系（`R_camera2gimbal`、`t_camera2gimbal`）→ 世界系（IMU 四元数）；
+3. **选板**：逐块解 PnP，取离云台最近的一块（仿真同一时刻只有一块可见）；
+4. **匀速模型**：相邻帧差分估计速度，并做一阶低通（0.5/0.5）抑制 PnP 抖动；
+5. **预测**：`p_pred = p + v × 0.25s`。
+
+主程序里的可视化：
+
+- 绿色框：当前检测到的装甲板；
+- 青色框 `PRED 250ms`：把预测位置投回图像后的预测框；
+- 左上：`PnP dist` 与 `static pose err vs GT`（只在目标近似静止时显示）；
+- 左下：`pred error @250ms`，250ms 后用实际观测位置与当时的预测比较。
+
+**真值来源**：仿真器在 `/tf` 里发布 `armor_*`（板中心）和 `gimbal_link`，IO 层订阅后
+把装甲板换算到云台系，取离 PnP 结果最近的一块作为真值。
+
+**标定修正**：课程配置里的 `R_camera2gimbal` 与仿真器 `/tf` 的实际相机会姿态差了 25°
+（旧值让 PnP 结果整体偏高约 0.9 m）。已按 `gimbal_link → camera_link → camera_optical_frame`
+更新为：
+
+```yaml
+R_camera2gimbal: [0.0, 0.0, 1.0,
+                  -1.0, 0.0, 0.0,
+                  0.0, -1.0, 0.0]
+t_camera2gimbal: [0.060, 0.002, 0.196]
+```
+
+**实测**（静止靶）：PnP 距离 2.69 m，与 `/tf` 真值的位姿误差约 **9.7 cm**；
+平移靶下 250 ms 预测误差约 **20 cm**（目标速度峰值约 0.8 m/s）。
 
 ## 接入课程仓库
 

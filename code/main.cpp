@@ -1,7 +1,10 @@
 #include "lessons.hpp"
 #include "io_context.hpp"
+#include "vision_gt.hpp"
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
+#include <deque>
+#include <optional>
 #include <csignal>
 #include <algorithm>
 #include <cstdio>
@@ -13,6 +16,23 @@ void on_signal(int) { interrupted = 1; }
 
 // 把第三讲的检测结果画到显示画面上。检测本身在 lesson03_detection 里完成，
 // 这里只负责可视化：角点顺序为左上、右上、右下、左下，与 types.hpp 的约定一致。
+// 把世界系（IMU 稳定系）下的点投影回图像：世界→云台→相机→像素。
+std::optional<cv::Point2f> projectWorld(const Eigen::Vector3d& world,
+                                        const Eigen::Quaterniond& imu_q,
+                                        const training::CameraCalibration& calibration) {
+  if (!calibration.valid()) return std::nullopt;
+  const Eigen::Vector3d gimbal = imu_q.inverse() * world;
+  const Eigen::Vector3d camera =
+      calibration.camera_to_gimbal.transpose() * (gimbal - calibration.camera_to_gimbal_translation);
+  if (camera.z() <= 1e-3) return std::nullopt;
+  const double fx = calibration.matrix.at<double>(0, 0);
+  const double fy = calibration.matrix.at<double>(1, 1);
+  const double cx = calibration.matrix.at<double>(0, 2);
+  const double cy = calibration.matrix.at<double>(1, 2);
+  return cv::Point2f(static_cast<float>(fx * camera.x() / camera.z() + cx),
+                     static_cast<float>(fy * camera.y() / camera.z() + cy));
+}
+
 void drawRune(cv::Mat& frame, const training::Rune& rune) {
   cv::Point polygon[4];
   for (int i = 0; i < 4; ++i) {
@@ -28,14 +48,21 @@ void drawRune(cv::Mat& frame, const training::Rune& rune) {
 }
 
 void drawArmors(cv::Mat& frame, const std::vector<training::Armor>& armors) {
+  // 只影响显示：检测角点是灯条外沿（P nP 用的物理尺寸），画框时外扩到整块板。
+  constexpr float kWiden = 1.35F;
+  constexpr float kTall = 2.05F;
   for (const auto& armor : armors) {
+    cv::Point2f center(0, 0);
+    for (const auto& corner : armor.corners) center += corner;
+    center *= 0.25F;
+
     // corners 是 Point2f，必须逐个取整，不能把 float 直接按 int 重解释。
-    const cv::Point polygon[4] = {
-        cv::Point(cvRound(armor.corners[0].x), cvRound(armor.corners[0].y)),
-        cv::Point(cvRound(armor.corners[1].x), cvRound(armor.corners[1].y)),
-        cv::Point(cvRound(armor.corners[2].x), cvRound(armor.corners[2].y)),
-        cv::Point(cvRound(armor.corners[3].x), cvRound(armor.corners[3].y)),
-    };
+    cv::Point polygon[4];
+    for (int i = 0; i < 4; ++i) {
+      const cv::Point2f p(center.x + (armor.corners[i].x - center.x) * kWiden,
+                          center.y + (armor.corners[i].y - center.y) * kTall);
+      polygon[i] = cv::Point(cvRound(p.x), cvRound(p.y));
+    }
 
     // 大小板用不同颜色区分：绿色 = 小装甲板，橙色 = 大装甲板（哨兵）。
     const cv::Scalar color = armor.large_armor ? cv::Scalar(0, 165, 255)
@@ -115,6 +142,80 @@ int main(int argc, char** argv) {
           armors, input->timestamp, input->imu_q, calibration, tracking);
       if (target)
         command = training::lesson05_aiming(*target, input->timestamp, input->bullet_speed);
+
+      // 第四讲可视化：PnP 位姿 vs 仿真真值；预测 250ms 后的位置并统计误差。
+      static std::deque<std::pair<double, Eigen::Vector3d>> predictions;
+      static double last_pred_error = 0.0;
+      static bool has_pred_error = false;
+      static double last_pose_error = 0.0;
+      static bool has_pose_error = false;
+      const double now_sec =
+          std::chrono::duration<double>(input->timestamp.time_since_epoch()).count();
+      constexpr double kPredictAhead = 0.25;  // 250 ms
+
+      if (target) {
+        // 真值：/tf 中离 PnP 结果最近的装甲板中心（云台系）。
+        // 位姿误差只在近似静止时显示：靶车在动时真值关联和框抖动都会放大误差。
+        if (target->velocity.norm() < 0.2) {
+          if (const auto gt = training::io::nearestArmorInGimbal(target->position)) {
+            last_pose_error = (target->position - *gt).norm();
+            has_pose_error = true;
+          }
+        } else {
+          has_pose_error = false;
+        }
+
+        const Eigen::Vector3d predicted = target->position + target->velocity * kPredictAhead;
+        predictions.emplace_back(now_sec, predicted);
+
+        // 画 250ms 后的预测框（青色）：预测点投回图像，框按距离缩放。
+        if (!armors.empty()) {
+          if (const auto predicted_px = projectWorld(predicted, input->imu_q, calibration)) {
+            const cv::Rect2f box = cv::boundingRect(armors.front().corners);
+            const double current_z = target->position.norm();
+            const double predicted_z = predicted.norm();
+            const float scale = predicted_z > 1e-3
+                ? static_cast<float>(current_z / predicted_z) : 1.0F;
+            const cv::Size2f size(box.width * scale, box.height * scale);
+            const cv::Rect2f rect(predicted_px->x - size.width * 0.5F,
+                                  predicted_px->y - size.height * 0.5F,
+                                  size.width, size.height);
+            cv::rectangle(input->image, rect, cv::Scalar(255, 200, 0), 2, cv::LINE_AA);
+            cv::putText(input->image, "PRED 250ms",
+                        cv::Point(static_cast<int>(rect.x), static_cast<int>(rect.y) - 6),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 200, 0), 1, cv::LINE_AA);
+          }
+        }
+
+        // 250ms 后：预测位置与该时刻实际观测到的目标位置比较，误差显示在左下角。
+        while (!predictions.empty() && now_sec - predictions.front().first >= kPredictAhead) {
+          const Eigen::Vector3d predicted_at = predictions.front().second;
+          predictions.pop_front();
+          last_pred_error = (predicted_at - target->position).norm();
+          has_pred_error = true;
+        }
+      }
+
+      if (devices.config.display) {
+        char line[128];
+        if (target) {
+          std::snprintf(line, sizeof(line), "PnP dist: %.2f m", target->position.norm());
+        } else {
+          std::snprintf(line, sizeof(line), "PnP dist: --");
+        }
+        cv::putText(input->image, line, cv::Point(24, 106), cv::FONT_HERSHEY_SIMPLEX,
+                    0.7, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+        if (has_pose_error) {
+          std::snprintf(line, sizeof(line), "static pose err vs GT: %.1f cm", last_pose_error * 100.0);
+          cv::putText(input->image, line, cv::Point(24, 140), cv::FONT_HERSHEY_SIMPLEX,
+                      0.7, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+        }
+        if (has_pred_error) {
+          std::snprintf(line, sizeof(line), "pred error @250ms: %.1f cm", last_pred_error * 100.0);
+          cv::putText(input->image, line, cv::Point(24, input->image.rows - 24),
+                      cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+        }
+      }
     }
     if (interrupted) break;
     devices.write(command);
