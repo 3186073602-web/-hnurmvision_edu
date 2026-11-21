@@ -1,5 +1,5 @@
 diff --git a/configs/simulation.yaml b/configs/simulation.yaml
-index ae82170..7d0f06a 100644
+index ae82170..5fb7afe 100644
 --- a/configs/simulation.yaml
 +++ b/configs/simulation.yaml
 @@ -10,7 +10,9 @@ distort_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
@@ -14,7 +14,7 @@ index ae82170..7d0f06a 100644
 -                  0.0, -0.9063077870, 0.4226182617]
 -t_camera2gimbal: [0.0, 0.0, 0.0]
 +                  0.0, -1.0, 0.0]
-+t_camera2gimbal: [0.060, 0.002, 0.196]
++t_camera2gimbal: [0.060, 0.002, 0.158]
 diff --git a/include/lessons.hpp b/include/lessons.hpp
 index 86fa46e..c990391 100644
 --- a/include/lessons.hpp
@@ -287,10 +287,10 @@ index a7f8efc..182496d 100644
  }
  }  // namespace training::io
 diff --git a/lessons/lesson03_detection.cpp b/lessons/lesson03_detection.cpp
-index c9cbbd8..ad4202c 100644
+index c9cbbd8..91958c8 100644
 --- a/lessons/lesson03_detection.cpp
 +++ b/lessons/lesson03_detection.cpp
-@@ -1,13 +1,330 @@
+@@ -1,13 +1,332 @@
  #include "lessons.hpp"
  
 +#include <opencv2/imgproc.hpp>
@@ -451,6 +451,8 @@ index c9cbbd8..ad4202c 100644
 +
 +  cv::Mat hsv;
 +  cv::cvtColor(image, hsv, cv::COLOR_BGR2HSV);
++  cv::Mat gray;
++  cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
 +
 +  cv::Mat blue_mask, red_mask;
 +  buildColorMasks(hsv, blue_mask, red_mask);

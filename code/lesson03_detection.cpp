@@ -151,6 +151,8 @@ std::vector<Armor> lesson03_detection(const cv::Mat& image) {
 
   cv::Mat hsv;
   cv::cvtColor(image, hsv, cv::COLOR_BGR2HSV);
+  cv::Mat gray;
+  cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
 
   cv::Mat blue_mask, red_mask;
   buildColorMasks(hsv, blue_mask, red_mask);
