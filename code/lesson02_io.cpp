@@ -159,8 +159,13 @@ std::optional<SensorData> IoContext::read() {
   SensorData data;
   data.image = std::move(frame);
   data.timestamp = stamp;
-  data.imu_q = Eigen::Quaterniond::Identity();
-  data.bullet_speed = 15.0;  // 仿真弹速，第四讲预测与第五讲解算使用
+  {
+    std::lock_guard<std::mutex> lock(b.mutex);
+    data.imu_q = b.has_gimbal ? b.gimbal_rotation.normalized()
+                              : Eigen::Quaterniond::Identity();
+    data.gimbal_origin = b.gimbal_position;
+  }
+  data.bullet_speed = 25.0;  // 仿真弹速，第四讲预测与第五讲解算使用
   return data;
 }
 

@@ -19,9 +19,10 @@ void on_signal(int) { interrupted = 1; }
 // 把世界系（IMU 稳定系）下的点投影回图像：世界→云台→相机→像素。
 std::optional<cv::Point2f> projectWorld(const Eigen::Vector3d& world,
                                         const Eigen::Quaterniond& imu_q,
+                                        const Eigen::Vector3d& origin,
                                         const training::CameraCalibration& calibration) {
   if (!calibration.valid()) return std::nullopt;
-  const Eigen::Vector3d gimbal = imu_q.inverse() * world;
+  const Eigen::Vector3d gimbal = imu_q.inverse() * (world - origin);
   const Eigen::Vector3d camera =
       calibration.camera_to_gimbal.transpose() * (gimbal - calibration.camera_to_gimbal_translation);
   if (camera.z() <= 1e-3) return std::nullopt;
@@ -139,9 +140,13 @@ int main(int argc, char** argv) {
         for (const auto& rune : runes) drawRune(input->image, rune);
       }
       const auto target = training::lesson04_tracking(
-          armors, input->timestamp, input->imu_q, calibration, tracking);
-      if (target)
+          armors, input->timestamp, input->imu_q, input->gimbal_origin, calibration, tracking);
+      if (target) {
         command = training::lesson05_aiming(*target, input->timestamp, input->bullet_speed);
+        // 火控：有解且允许开火时持续请求发射；云台对齐后弹丸自然命中。
+        if (command.control && devices.config.allow_fire) command.shoot = true;
+
+      }
 
       // 第四讲可视化：PnP 位姿 vs 仿真真值；预测 250ms 后的位置并统计误差。
       static std::deque<std::pair<double, Eigen::Vector3d>> predictions;
@@ -171,7 +176,7 @@ int main(int argc, char** argv) {
 
         // 画 250ms 后的预测框（青色）：预测点投回图像，框按距离缩放。
         if (!armors.empty()) {
-          if (const auto predicted_px = projectWorld(predicted, input->imu_q, calibration)) {
+          if (const auto predicted_px = projectWorld(predicted, input->imu_q, input->gimbal_origin, calibration)) {
             const cv::Rect2f box = cv::boundingRect(armors.front().corners);
             const double current_z = target->position.norm();
             const double predicted_z = predicted.norm();

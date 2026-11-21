@@ -29,9 +29,6 @@ constexpr double kProcessNoise = 4.0;
 constexpr double kMeasurementNoise = 1.5e-2 * 1.5e-2;
 constexpr double kMaxSpeed = 4.0;
 constexpr double kMaxAccel = 8.0;
-// 观测门限：镜头快速转动时，目标在云台系里会“瞬移”。超过这个距离就当作
-// 重新捕获，清空速度/加速度，避免滤波器把这次跳变当成真实速度。
-constexpr double kMeasurementGate = 0.8;
 
 // 单轴常加速度卡尔曼一步预测 + 更新。
 void kalmanStep(double measurement, double dt, double& position, double& velocity,
@@ -128,7 +125,8 @@ bool solveArmorPose(const Armor& armor, const CameraCalibration& calibration,
 
 std::optional<Target> lesson04_tracking(const std::vector<Armor>& armors,
     TimePoint timestamp, const Eigen::Quaterniond& imu_q,
-    const CameraCalibration& calibration, TrackingState& state) {
+    const Eigen::Vector3d& world_origin, const CameraCalibration& calibration,
+    TrackingState& state) {
   // ===== 实现区 BEGIN =====
   if (armors.empty()) {
     state.valid = false;
@@ -148,7 +146,7 @@ std::optional<Target> lesson04_tracking(const std::vector<Armor>& armors,
     // 相机系 → 云台系 → 世界系（IMU 稳定系）。
     const Eigen::Vector3d gimbal_xyz =
         calibration.camera_to_gimbal * camera_xyz + calibration.camera_to_gimbal_translation;
-    const Eigen::Vector3d world_xyz = imu_q * gimbal_xyz;
+    const Eigen::Vector3d world_xyz = imu_q * gimbal_xyz + world_origin;
 
     const double distance = world_xyz.norm();
     if (!found || distance < best_distance) {
@@ -171,17 +169,7 @@ std::optional<Target> lesson04_tracking(const std::vector<Armor>& armors,
       std::chrono::duration<double>(timestamp.time_since_epoch()).count();
   if (state.valid && state.last_time_sec > 0.0) {
     const double dt_pair = now_sec - state.last_time_sec;
-    const Eigen::Vector3d innovation = best_position - (state.position + state.velocity * dt_pair);
-    if (innovation.norm() > kMeasurementGate) {
-      velocity.setZero();
-      acceleration.setZero();
-      for (auto& covariance : state.covariance) {
-        covariance = Eigen::Matrix3d::Zero();
-        covariance(0, 0) = 1.0;
-        covariance(1, 1) = 10.0;
-        covariance(2, 2) = 10.0;
-      }
-    } else if (dt_pair > 1e-3 && dt_pair < kMaxTrackGap) {
+    if (dt_pair > 1e-3 && dt_pair < kMaxTrackGap) {
       position = state.position;
       velocity = state.velocity;
       acceleration = state.acceleration;
@@ -219,8 +207,10 @@ std::optional<Target> lesson04_tracking(const std::vector<Armor>& armors,
   state.last_time_sec = now_sec;
   state.last_distance = best_distance;
 
+  // 课程约定 Target.position 是“相对云台原点”的向量；滤波在 map 系里做，
+  // 输出时减去当前云台原点，得到 map 朝向、云台中心的相对位置。
   Target target;
-  target.position = position;
+  target.position = position - world_origin;
   target.velocity = velocity;
   target.acceleration = acceleration;
   return target;

@@ -1,7 +1,15 @@
 diff --git a/configs/simulation.yaml b/configs/simulation.yaml
-index ae82170..5fb7afe 100644
+index ae82170..d07e61c 100644
 --- a/configs/simulation.yaml
 +++ b/configs/simulation.yaml
+@@ -1,6 +1,6 @@
+ # 只需要修改显示、发射许可和相机标定。
+ display: true
+-allow_fire: false
++allow_fire: true
+ 
+ # 仿真环境下的相机内参
+ camera_matrix: [1303.6753236814714, 0.0, 720.0,
 @@ -10,7 +10,9 @@ distort_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
  
  # 相机光学坐标系到云台坐标系：p_gimbal = R * p_camera + t。
@@ -16,10 +24,10 @@ index ae82170..5fb7afe 100644
 +                  0.0, -1.0, 0.0]
 +t_camera2gimbal: [0.060, 0.002, 0.158]
 diff --git a/include/lessons.hpp b/include/lessons.hpp
-index 86fa46e..c990391 100644
+index 86fa46e..480661b 100644
 --- a/include/lessons.hpp
 +++ b/include/lessons.hpp
-@@ -6,6 +6,13 @@
+@@ -6,7 +6,16 @@
  
  namespace training {
  std::vector<Armor> lesson03_detection(const cv::Mat& image);
@@ -31,8 +39,12 @@ index 86fa46e..c990391 100644
 +};
 +std::vector<Rune> lesson03_rune_detection(const cv::Mat& image);
  std::optional<Target> lesson04_tracking(const std::vector<Armor>& armors,
-     TimePoint timestamp, const Eigen::Quaterniond& imu_q, const CameraCalibration& calibration, TrackingState& state);
+-    TimePoint timestamp, const Eigen::Quaterniond& imu_q, const CameraCalibration& calibration, TrackingState& state);
++    TimePoint timestamp, const Eigen::Quaterniond& imu_q,
++    const Eigen::Vector3d& world_origin, const CameraCalibration& calibration,
++    TrackingState& state);
  Command lesson05_aiming(const Target& target, TimePoint timestamp, double bullet_speed);
+ }  // namespace training
 diff --git a/include/tracking_state.hpp b/include/tracking_state.hpp
 index 3f3cc22..d91476b 100644
 --- a/include/tracking_state.hpp
@@ -61,10 +73,18 @@ index 3f3cc22..d91476b 100644
  };
  }  // namespace training
 diff --git a/include/types.hpp b/include/types.hpp
-index 53d64e7..4a1c60f 100644
+index 53d64e7..d5f728d 100644
 --- a/include/types.hpp
 +++ b/include/types.hpp
-@@ -38,6 +38,9 @@ struct Armor {
+@@ -23,6 +23,7 @@ struct SensorData {
+   cv::Mat image;  // CV_8UC3，BGR，独立拥有像素内存
+   TimePoint timestamp{};
+   Eigen::Quaterniond imu_q = Eigen::Quaterniond::Identity();
++  Eigen::Vector3d gimbal_origin = Eigen::Vector3d::Zero();
+   double bullet_speed = 0;  // m/s
+ };
+ 
+@@ -38,6 +39,9 @@ struct Armor {
  struct Target {
    Eigen::Vector3d position = Eigen::Vector3d::Zero();  // m，IMU稳定系中相对云台原点的目标向量
    Eigen::Vector3d velocity = Eigen::Vector3d::Zero();  // m/s，同一坐标系
@@ -75,10 +95,10 @@ index 53d64e7..4a1c60f 100644
  
  // 第五讲输出：绝对角使用 rad，IO 边界统一转换单位和方向。
 diff --git a/lessons/lesson02_io.cpp b/lessons/lesson02_io.cpp
-index a7f8efc..182496d 100644
+index a7f8efc..b01440f 100644
 --- a/lessons/lesson02_io.cpp
 +++ b/lessons/lesson02_io.cpp
-@@ -1,20 +1,204 @@
+@@ -1,20 +1,209 @@
  #include "io_context.hpp"
 +
 +#include "vision_gt.hpp"
@@ -242,8 +262,13 @@ index a7f8efc..182496d 100644
 +  SensorData data;
 +  data.image = std::move(frame);
 +  data.timestamp = stamp;
-+  data.imu_q = Eigen::Quaterniond::Identity();
-+  data.bullet_speed = 15.0;  // 仿真弹速，第四讲预测与第五讲解算使用
++  {
++    std::lock_guard<std::mutex> lock(b.mutex);
++    data.imu_q = b.has_gimbal ? b.gimbal_rotation.normalized()
++                              : Eigen::Quaterniond::Identity();
++    data.gimbal_origin = b.gimbal_position;
++  }
++  data.bullet_speed = 25.0;  // 仿真弹速，第四讲预测与第五讲解算使用
 +  return data;
  }
  
@@ -631,10 +656,10 @@ index c9cbbd8..91958c8 100644
  }
  }  // namespace training
 diff --git a/lessons/lesson04_tracking.cpp b/lessons/lesson04_tracking.cpp
-index d0a03a2..8872e2f 100644
+index d0a03a2..8a55a79 100644
 --- a/lessons/lesson04_tracking.cpp
 +++ b/lessons/lesson04_tracking.cpp
-@@ -1,28 +1,229 @@
+@@ -1,28 +1,219 @@
  #include "lessons.hpp"
  
 +#include <opencv2/calib3d.hpp>
@@ -683,9 +708,6 @@ index d0a03a2..8872e2f 100644
 +constexpr double kMeasurementNoise = 1.5e-2 * 1.5e-2;
 +constexpr double kMaxSpeed = 4.0;
 +constexpr double kMaxAccel = 8.0;
-+// 观测门限：镜头快速转动时，目标在云台系里会“瞬移”。超过这个距离就当作
-+// 重新捕获，清空速度/加速度，避免滤波器把这次跳变当成真实速度。
-+constexpr double kMeasurementGate = 0.8;
 +
 +// 单轴常加速度卡尔曼一步预测 + 更新。
 +void kalmanStep(double measurement, double dt, double& position, double& velocity,
@@ -783,7 +805,8 @@ index d0a03a2..8872e2f 100644
  std::optional<Target> lesson04_tracking(const std::vector<Armor>& armors,
 -    TimePoint timestamp, const Eigen::Quaterniond& imu_q, const CameraCalibration& calibration, TrackingState& state) {
 +    TimePoint timestamp, const Eigen::Quaterniond& imu_q,
-+    const CameraCalibration& calibration, TrackingState& state) {
++    const Eigen::Vector3d& world_origin, const CameraCalibration& calibration,
++    TrackingState& state) {
    // ===== 实现区 BEGIN =====
 -  (void)armors; (void)timestamp; (void)imu_q; (void)calibration; (void)state;
 -  return std::nullopt;
@@ -805,7 +828,7 @@ index d0a03a2..8872e2f 100644
 +    // 相机系 → 云台系 → 世界系（IMU 稳定系）。
 +    const Eigen::Vector3d gimbal_xyz =
 +        calibration.camera_to_gimbal * camera_xyz + calibration.camera_to_gimbal_translation;
-+    const Eigen::Vector3d world_xyz = imu_q * gimbal_xyz;
++    const Eigen::Vector3d world_xyz = imu_q * gimbal_xyz + world_origin;
 +
 +    const double distance = world_xyz.norm();
 +    if (!found || distance < best_distance) {
@@ -828,17 +851,7 @@ index d0a03a2..8872e2f 100644
 +      std::chrono::duration<double>(timestamp.time_since_epoch()).count();
 +  if (state.valid && state.last_time_sec > 0.0) {
 +    const double dt_pair = now_sec - state.last_time_sec;
-+    const Eigen::Vector3d innovation = best_position - (state.position + state.velocity * dt_pair);
-+    if (innovation.norm() > kMeasurementGate) {
-+      velocity.setZero();
-+      acceleration.setZero();
-+      for (auto& covariance : state.covariance) {
-+        covariance = Eigen::Matrix3d::Zero();
-+        covariance(0, 0) = 1.0;
-+        covariance(1, 1) = 10.0;
-+        covariance(2, 2) = 10.0;
-+      }
-+    } else if (dt_pair > 1e-3 && dt_pair < kMaxTrackGap) {
++    if (dt_pair > 1e-3 && dt_pair < kMaxTrackGap) {
 +      position = state.position;
 +      velocity = state.velocity;
 +      acceleration = state.acceleration;
@@ -876,19 +889,102 @@ index d0a03a2..8872e2f 100644
 +  state.last_time_sec = now_sec;
 +  state.last_distance = best_distance;
 +
++  // 课程约定 Target.position 是“相对云台原点”的向量；滤波在 map 系里做，
++  // 输出时减去当前云台原点，得到 map 朝向、云台中心的相对位置。
 +  Target target;
-+  target.position = position;
++  target.position = position - world_origin;
 +  target.velocity = velocity;
 +  target.acceleration = acceleration;
 +  return target;
    // ===== 实现区 END =====
  }
  }  // namespace training
+diff --git a/lessons/lesson05_aiming.cpp b/lessons/lesson05_aiming.cpp
+index bb2b357..ba7efc3 100644
+--- a/lessons/lesson05_aiming.cpp
++++ b/lessons/lesson05_aiming.cpp
+@@ -1,5 +1,8 @@
+ #include "lessons.hpp"
+ 
++#include <cmath>
++#include <chrono>
++
+ namespace training {
+ // 第五讲：弹道解算
+ //
+@@ -15,8 +18,65 @@ namespace training {
+ //   - yaw     : 世界/IMU 参考系下的绝对偏航角，单位 rad；
+ //   - pitch   : 世界/IMU 参考系下的绝对俯仰角，单位 rad。
+ // 验收：仿真器完成静止靶、平移靶任务。
++namespace {
++constexpr double kGravity = 9.81;          // m/s²
++constexpr double kMountElevation = 27.0;  // 仿真实测零位（课程文档写 25°，实测 27° 命中）
++constexpr double kMaxIterations = 5;
++constexpr double kSpeedTolerance = 1e-3;   // 飞行时间收敛阈值，s
++
++// 弹道解算：已知水平距离 d、相对高度 h、弹速 v0，返回仰角 theta、飞行时间 tf。
++// 解 a·tan²θ − d·tanθ + (a+h) = 0（a = g·d²/(2v0²)），取低伸弹道（时间短的解）。
++bool solveBallistics(double d, double h, double v0, double& theta, double& tf) {
++  if (!(v0 > 1e-3) || d < 1e-3) return false;
++  const double a = kGravity * d * d / (2.0 * v0 * v0);
++  const double discriminant = d * d - 4.0 * a * (a + h);
++  if (discriminant < 0.0) return false;  // 打不到：太远/太高/弹速太低
++
++  const double tan_theta = (d - std::sqrt(discriminant)) / (2.0 * a);
++  theta = std::atan(tan_theta);
++  const double cos_theta = std::cos(theta);
++  if (std::abs(cos_theta) < 1e-6) return false;
++  tf = d / (v0 * cos_theta);
++  return std::isfinite(tf) && tf > 0.0;
++}
++}  // namespace
++
+ Command lesson05_aiming(const Target& target, TimePoint timestamp, double bullet_speed) {
+-  (void)target; (void)timestamp; (void)bullet_speed;
+-  return Command{};
++  Command command;
++
++  // 处理延迟：观测时刻 → 本函数被调用。仿真没有发弹延时（delay = 0）。
++  const double dt1 = std::chrono::duration<double>(Clock::now() - timestamp).count();
++  const double delay = 0.0;
++
++  // 不动点迭代：p_hit 依赖 t_f，t_f 又依赖 p_hit。
++  double tf = 0.0;
++  Eigen::Vector3d hit = target.position;
++  double theta = 0.0;
++  bool solvable = false;
++  for (int i = 0; i < kMaxIterations; ++i) {
++    hit = target.position + target.velocity * (dt1 + delay + tf);
++    const double d = std::hypot(hit.x(), hit.y());  // 水平距离，不是直线距离
++    const double h = hit.z();
++    double new_tf = 0.0;
++    double new_theta = 0.0;
++    if (!solveBallistics(d, h, bullet_speed, new_theta, new_tf)) {
++      solvable = false;
++      break;
++    }
++    solvable = true;
++    theta = new_theta;
++    if (std::abs(new_tf - tf) < kSpeedTolerance) {
++      tf = new_tf;
++      break;
++    }
++    tf = new_tf;
++  }
++  if (!solvable) return command;
++
++  // yaw 用几何：世界系绝对角；pitch 用弹道：25° 零位 − 仰角。
++  command.control = true;
++  command.yaw = std::atan2(hit.y(), hit.x());
++  command.pitch = kMountElevation * kPi / 180.0 - theta;
++  return command;
+ }
+ }  // namespace training
 diff --git a/src/main.cpp b/src/main.cpp
-index 4a7bf8c..63633c3 100644
+index 4a7bf8c..45a5c0b 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
-@@ -1,13 +1,106 @@
+@@ -1,12 +1,106 @@
  #include "lessons.hpp"
  #include "io_context.hpp"
 +#include "vision_gt.hpp"
@@ -910,9 +1006,10 @@ index 4a7bf8c..63633c3 100644
 +// 把世界系（IMU 稳定系）下的点投影回图像：世界→云台→相机→像素。
 +std::optional<cv::Point2f> projectWorld(const Eigen::Vector3d& world,
 +                                        const Eigen::Quaterniond& imu_q,
++                                        const Eigen::Vector3d& origin,
 +                                        const training::CameraCalibration& calibration) {
 +  if (!calibration.valid()) return std::nullopt;
-+  const Eigen::Vector3d gimbal = imu_q.inverse() * world;
++  const Eigen::Vector3d gimbal = imu_q.inverse() * (world - origin);
 +  const Eigen::Vector3d camera =
 +      calibration.camera_to_gimbal.transpose() * (gimbal - calibration.camera_to_gimbal_translation);
 +  if (camera.z() <= 1e-3) return std::nullopt;
@@ -936,8 +1033,8 @@ index 4a7bf8c..63633c3 100644
 +  std::snprintf(label, sizeof(label), "RUNE %.2f", rune.confidence);
 +  cv::putText(frame, label, cv::Point(polygon[0].x, std::max(14, polygon[0].y - 6)),
 +              cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 235, 255), 1, cv::LINE_AA);
- }
- 
++}
++
 +void drawArmors(cv::Mat& frame, const std::vector<training::Armor>& armors) {
 +  // 只影响显示：检测角点是灯条外沿（P nP 用的物理尺寸），画框时外扩到整块板。
 +  constexpr float kWiden = 1.35F;
@@ -989,13 +1086,12 @@ index 4a7bf8c..63633c3 100644
 +                cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 255), 2,
 +                cv::LINE_AA);
 +  }
-+}
+ }
 +}  // namespace
-+
+ 
  int main(int argc, char** argv) {
    std::signal(SIGINT, on_signal);
-   std::signal(SIGTERM, on_signal);
-@@ -17,21 +110,126 @@ int main(int argc, char** argv) {
+@@ -17,21 +111,130 @@ int main(int argc, char** argv) {
    training::TrackingState tracking;
    devices.open();
  
@@ -1029,9 +1125,15 @@ index 4a7bf8c..63633c3 100644
 +        for (const auto& rune : runes) drawRune(input->image, rune);
 +      }
        const auto target = training::lesson04_tracking(
-           armors, input->timestamp, input->imu_q, calibration, tracking);
-       if (target)
+-          armors, input->timestamp, input->imu_q, calibration, tracking);
+-      if (target)
++          armors, input->timestamp, input->imu_q, input->gimbal_origin, calibration, tracking);
++      if (target) {
          command = training::lesson05_aiming(*target, input->timestamp, input->bullet_speed);
++        // 火控：有解且允许开火时持续请求发射；云台对齐后弹丸自然命中。
++        if (command.control && devices.config.allow_fire) command.shoot = true;
++
++      }
 +
 +      // 第四讲可视化：PnP 位姿 vs 仿真真值；预测 250ms 后的位置并统计误差。
 +      static std::deque<std::pair<double, Eigen::Vector3d>> predictions;
@@ -1061,7 +1163,7 @@ index 4a7bf8c..63633c3 100644
 +
 +        // 画 250ms 后的预测框（青色）：预测点投回图像，框按距离缩放。
 +        if (!armors.empty()) {
-+          if (const auto predicted_px = projectWorld(predicted, input->imu_q, calibration)) {
++          if (const auto predicted_px = projectWorld(predicted, input->imu_q, input->gimbal_origin, calibration)) {
 +            const cv::Rect2f box = cv::boundingRect(armors.front().corners);
 +            const double current_z = target->position.norm();
 +            const double predicted_z = predicted.norm();

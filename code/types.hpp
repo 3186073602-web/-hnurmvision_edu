@@ -23,6 +23,7 @@ struct SensorData {
   cv::Mat image;  // CV_8UC3，BGR，独立拥有像素内存
   TimePoint timestamp{};
   Eigen::Quaterniond imu_q = Eigen::Quaterniond::Identity();
+  Eigen::Vector3d gimbal_origin = Eigen::Vector3d::Zero();
   double bullet_speed = 0;  // m/s
 };
 

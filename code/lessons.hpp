@@ -14,6 +14,8 @@ struct Rune {
 };
 std::vector<Rune> lesson03_rune_detection(const cv::Mat& image);
 std::optional<Target> lesson04_tracking(const std::vector<Armor>& armors,
-    TimePoint timestamp, const Eigen::Quaterniond& imu_q, const CameraCalibration& calibration, TrackingState& state);
+    TimePoint timestamp, const Eigen::Quaterniond& imu_q,
+    const Eigen::Vector3d& world_origin, const CameraCalibration& calibration,
+    TrackingState& state);
 Command lesson05_aiming(const Target& target, TimePoint timestamp, double bullet_speed);
 }  // namespace training
