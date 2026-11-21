@@ -165,7 +165,8 @@ int main(int argc, char** argv) {
           has_pose_error = false;
         }
 
-        const Eigen::Vector3d predicted = target->position + target->velocity * kPredictAhead;
+        const Eigen::Vector3d predicted = target->position + target->velocity * kPredictAhead +
+                                          0.5 * target->acceleration * kPredictAhead * kPredictAhead;
         predictions.emplace_back(now_sec, predicted);
 
         // 画 250ms 后的预测框（青色）：预测点投回图像，框按距离缩放。

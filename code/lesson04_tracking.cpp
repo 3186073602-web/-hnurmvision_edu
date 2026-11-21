@@ -21,11 +21,47 @@ constexpr double kHalfHeight = 0.0275 * kPlateScale;
 // 超过这个时间还没更新，就认为目标丢失，速度清零。
 constexpr double kMaxTrackGap = 0.5;
 
-// alpha-beta 滤波系数：位置信任观测多一些，速度靠残差缓慢修正，
-// 避免单帧 PnP 抖动直接放大成速度噪声（参考 rm_vision/WUST 的“不要直接信任单帧 PnP”思路）。
-constexpr double kAlpha = 0.6;
-constexpr double kBeta = 0.05;
-constexpr double kMaxSpeed = 3.0;
+// 常加速度卡尔曼滤波参数。
+// 过程噪声 q 取“加加速度”谱密度（m²/s⁵），量测噪声 r 取 PnP 位置方差（m²）。
+// 目标按 ±0.5 m / 4 s 正弦平移，加速度约 1.2 m/s²，q 取 4 足够跟上；
+// r 对应约 1.5 cm 的 PnP 抖动。
+constexpr double kProcessNoise = 4.0;
+constexpr double kMeasurementNoise = 1.5e-2 * 1.5e-2;
+constexpr double kMaxSpeed = 4.0;
+constexpr double kMaxAccel = 8.0;
+
+// 单轴常加速度卡尔曼一步预测 + 更新。
+void kalmanStep(double measurement, double dt, double& position, double& velocity,
+                double& acceleration, Eigen::Matrix3d& covariance) {
+  Eigen::Matrix3d transition;
+  transition << 1.0, dt, 0.5 * dt * dt,
+                0.0, 1.0, dt,
+                0.0, 0.0, 1.0;
+
+  const double dt2 = dt * dt;
+  const double dt3 = dt2 * dt;
+  const double dt4 = dt3 * dt;
+  const double dt5 = dt4 * dt;
+  Eigen::Matrix3d process;
+  process << dt5 / 20.0, dt4 / 8.0, dt3 / 6.0,
+             dt4 / 8.0, dt3 / 3.0, dt2 / 2.0,
+             dt3 / 6.0, dt2 / 2.0, dt;
+  process *= kProcessNoise;
+
+  Eigen::Vector3d state(position, velocity, acceleration);
+  state = transition * state;
+  covariance = transition * covariance * transition.transpose() + process;
+
+  const Eigen::Vector3d observation(1.0, 0.0, 0.0);
+  const double innovation_var = observation.dot(covariance * observation) + kMeasurementNoise;
+  const Eigen::Vector3d gain = covariance * observation / innovation_var;
+  state += gain * (measurement - state(0));
+  covariance = (Eigen::Matrix3d::Identity() - gain * observation.transpose()) * covariance;
+
+  position = state(0);
+  velocity = state(1);
+  acceleration = state(2);
+}
 
 std::vector<cv::Point3f> armorObjectPoints(bool large) {
   const double hw = large ? kLargeHalfWidth : kSmallHalfWidth;
@@ -124,32 +160,56 @@ std::optional<Target> lesson04_tracking(const std::vector<Armor>& armors,
     return std::nullopt;
   }
 
-  // 匀速模型 + alpha-beta 滤波：先用上一帧状态预测，再用观测残差修正。
+  // 常加速度卡尔曼：先用上一帧状态预测，再用 PnP 位置更新。
   Eigen::Vector3d position = best_position;
   Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
+  Eigen::Vector3d acceleration = Eigen::Vector3d::Zero();
   const double now_sec =
       std::chrono::duration<double>(timestamp.time_since_epoch()).count();
   if (state.valid && state.last_time_sec > 0.0) {
     const double dt_pair = now_sec - state.last_time_sec;
     if (dt_pair > 1e-3 && dt_pair < kMaxTrackGap) {
-      const Eigen::Vector3d predicted = state.position + state.velocity * dt_pair;
-      const Eigen::Vector3d residual = best_position - predicted;
-      position = predicted + kAlpha * residual;
-      velocity = state.velocity + (kBeta / dt_pair) * residual;
+      position = state.position;
+      velocity = state.velocity;
+      acceleration = state.acceleration;
+      for (int axis = 0; axis < 3; ++axis) {
+        double p = position(axis), v = velocity(axis), a = acceleration(axis);
+        kalmanStep(best_position(axis), dt_pair, p, v, a, state.covariance[axis]);
+        position(axis) = p;
+        velocity(axis) = v;
+        acceleration(axis) = a;
+      }
       const double speed = velocity.norm();
       if (speed > kMaxSpeed) velocity *= kMaxSpeed / speed;
+      if (acceleration.norm() > kMaxAccel) {
+        acceleration *= kMaxAccel / acceleration.norm();
+      }
+    } else {
+      for (auto& covariance : state.covariance) {
+        covariance = Eigen::Matrix3d::Identity() * 1.0;
+      }
+    }
+  } else {
+    // 初始化：位置直接取观测，速度和加速度置零，协方差给足。
+    for (auto& covariance : state.covariance) {
+      covariance = Eigen::Matrix3d::Zero();
+      covariance(0, 0) = 1.0;
+      covariance(1, 1) = 10.0;
+      covariance(2, 2) = 10.0;
     }
   }
 
   state.valid = true;
   state.position = position;
   state.velocity = velocity;
+  state.acceleration = acceleration;
   state.last_time_sec = now_sec;
   state.last_distance = best_distance;
 
   Target target;
   target.position = position;
   target.velocity = velocity;
+  target.acceleration = acceleration;
   return target;
   // ===== 实现区 END =====
 }
