@@ -116,8 +116,26 @@ R_camera2gimbal: [0.0, 0.0, 1.0,
 t_camera2gimbal: [0.060, 0.002, 0.196]
 ```
 
-**实测**（静止靶）：PnP 距离 2.69 m，与 `/tf` 真值的位姿误差约 **9.7 cm**；
-平移靶下 250 ms 预测误差约 **20 cm**（目标速度峰值约 0.8 m/s）。
+### 借鉴的开源做法与效果
+
+参考了 [rm_vision](https://index.rosdabbler.com/r/rm_vision/)、
+[WUST-RM/awakening 的状态估计文档](https://raw.githubusercontent.com/WUST-RM/awakening/refs/heads/main/docs/algorithm/estimation.md)、
+[rmoss_contrib #13「降低自由度提高 PnP 精度」](https://github.com/robomaster-oss/rmoss_contrib/issues/13)
+和 [中南 FYT 视觉](https://github.com/HYL0924/FYT2024_vision)，落到本实现的三点：
+
+1. **不要直接信任单帧 PnP**：IPPE 只当初始值，再用 `solvePnPRefineLM` 最小化重投影误差，
+   重投影 RMSE > 15 px 的解直接丢弃；
+2. **用 alpha-beta 滤波代替裸差分**：位置/速度用预测-残差修正（α=0.6、β=0.05），
+   避免单帧 PnP 抖动被放大成速度噪声，预测框不再来回跳；
+3. **板尺寸标定**：按 `/tf` 真值反算，仿真渲染的板比标称 135×55 mm 大约 3.3%，
+   乘上标定系数后距离偏差从 9 cm 降到 1 cm 量级。
+
+**实测**：
+
+| 指标 | 改进前 | 改进后 |
+|---|---|---|
+| 静止靶 PnP 位姿误差 | 9.7 cm | **3.8 cm** |
+| 平移靶 250 ms 预测误差 | ~20 cm | **1–12 cm**（典型 3–7 cm） |
 
 ## 接入课程仓库
 

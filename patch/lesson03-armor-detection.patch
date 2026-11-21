@@ -611,10 +611,10 @@ index c9cbbd8..ad4202c 100644
  }
  }  // namespace training
 diff --git a/lessons/lesson04_tracking.cpp b/lessons/lesson04_tracking.cpp
-index d0a03a2..45f232b 100644
+index d0a03a2..be35482 100644
 --- a/lessons/lesson04_tracking.cpp
 +++ b/lessons/lesson04_tracking.cpp
-@@ -1,28 +1,122 @@
+@@ -1,28 +1,156 @@
  #include "lessons.hpp"
  
 +#include <opencv2/calib3d.hpp>
@@ -645,12 +645,21 @@ index d0a03a2..45f232b 100644
 +
 +// 装甲板物理尺寸（米）。小板 135×55 mm，大板（哨兵）225×55 mm。
 +// 第三讲的角点已经外扩到整块板，所以直接用板的外沿尺寸。
-+constexpr double kSmallHalfWidth = 0.0675;
-+constexpr double kLargeHalfWidth = 0.1125;
-+constexpr double kHalfHeight = 0.0275;
++// 标定系数：仿真渲染的装甲板比标称 135×55 mm 略大（按 /tf 真值反算约 3.3%），
++// 乘上它可以把 PnP 的距离偏差从 ~9 cm 压到 ~1 cm 量级。
++constexpr double kPlateScale = 1.033;
++constexpr double kSmallHalfWidth = 0.0675 * kPlateScale;
++constexpr double kLargeHalfWidth = 0.1125 * kPlateScale;
++constexpr double kHalfHeight = 0.0275 * kPlateScale;
 +
 +// 超过这个时间还没更新，就认为目标丢失，速度清零。
 +constexpr double kMaxTrackGap = 0.5;
++
++// alpha-beta 滤波系数：位置信任观测多一些，速度靠残差缓慢修正，
++// 避免单帧 PnP 抖动直接放大成速度噪声（参考 rm_vision/WUST 的“不要直接信任单帧 PnP”思路）。
++constexpr double kAlpha = 0.6;
++constexpr double kBeta = 0.05;
++constexpr double kMaxSpeed = 3.0;
 +
 +std::vector<cv::Point3f> armorObjectPoints(bool large) {
 +  const double hw = large ? kLargeHalfWidth : kSmallHalfWidth;
@@ -685,6 +694,27 @@ index d0a03a2..45f232b 100644
 +    return false;
 +  }
 +  if (tvec[2] <= 0.0) return false;  // 板子在相机后面，丢弃
++
++  // IPPE 只保证平面四点的初值，再用 LM 最小化重投影误差，顺带拒绝离谱解。
++  const auto object_points = armorObjectPoints(armor.large_armor);
++  try {
++    cv::solvePnPRefineLM(object_points, image_points, calibration.matrix,
++                         calibration.distortion, rvec, tvec);
++  } catch (const cv::Exception&) {
++    return false;
++  }
++  std::vector<cv::Point2f> projected;
++  cv::projectPoints(object_points, rvec, tvec, calibration.matrix,
++                    calibration.distortion, projected);
++  double squared = 0.0;
++  for (std::size_t i = 0; i < projected.size(); ++i) {
++    const double dx = projected[i].x - image_points[i].x;
++    const double dy = projected[i].y - image_points[i].y;
++    squared += dx * dx + dy * dy;
++  }
++  const double rmse = std::sqrt(squared / projected.size());
++  if (rmse > 15.0) return false;      // 重投影误差过大，视为坏解
++
 +  camera_xyz = Eigen::Vector3d(tvec[0], tvec[1], tvec[2]);
 +  return true;
 +}
@@ -731,27 +761,31 @@ index d0a03a2..45f232b 100644
 +    return std::nullopt;
 +  }
 +
-+  // 匀速模型：相邻两帧差分估计速度；丢帧太久或时间间隔异常时清零。
++  // 匀速模型 + alpha-beta 滤波：先用上一帧状态预测，再用观测残差修正。
++  Eigen::Vector3d position = best_position;
 +  Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
 +  const double now_sec =
 +      std::chrono::duration<double>(timestamp.time_since_epoch()).count();
 +  if (state.valid && state.last_time_sec > 0.0) {
 +    const double dt_pair = now_sec - state.last_time_sec;
 +    if (dt_pair > 1e-3 && dt_pair < kMaxTrackGap) {
-+      // 差分速度抖动大，做一阶低通（新值权重 0.5），预测框才不会来回跳。
-+      const Eigen::Vector3d measured = (best_position - state.position) / dt_pair;
-+      velocity = state.velocity * 0.5 + measured * 0.5;
++      const Eigen::Vector3d predicted = state.position + state.velocity * dt_pair;
++      const Eigen::Vector3d residual = best_position - predicted;
++      position = predicted + kAlpha * residual;
++      velocity = state.velocity + (kBeta / dt_pair) * residual;
++      const double speed = velocity.norm();
++      if (speed > kMaxSpeed) velocity *= kMaxSpeed / speed;
 +    }
 +  }
 +
 +  state.valid = true;
-+  state.position = best_position;
++  state.position = position;
 +  state.velocity = velocity;
 +  state.last_time_sec = now_sec;
 +  state.last_distance = best_distance;
 +
 +  Target target;
-+  target.position = best_position;
++  target.position = position;
 +  target.velocity = velocity;
 +  return target;
    // ===== 实现区 END =====
