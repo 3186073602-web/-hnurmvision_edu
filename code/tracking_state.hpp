@@ -16,6 +16,8 @@ struct TrackingState {
   Eigen::Matrix3d covariance[3] = {
       Eigen::Matrix3d::Identity(), Eigen::Matrix3d::Identity(), Eigen::Matrix3d::Identity()};
   double last_time_sec = 0.0;
-  double last_distance = 0.0;  // m，PnP 距离，用于选板
+  double last_distance = 0.0;
+  // 连续丢失帧计数：短时丢失用预测顶住，不立刻清状态。
+  int miss_frames = 0;  // m，PnP 距离，用于选板
 };
 }  // namespace training

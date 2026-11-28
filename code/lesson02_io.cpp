@@ -9,6 +9,7 @@
 #include <sensor_msgs/msg/image.hpp>
 
 #include <chrono>
+#include <deque>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -42,6 +43,21 @@ struct Bridge {
   Eigen::Vector3d gimbal_position = Eigen::Vector3d::Zero();
   Eigen::Quaterniond gimbal_rotation = Eigen::Quaterniond::Identity();
   bool has_gimbal = false;
+  // 底盘与云台分层的量：云台世界姿态 = 底盘姿态 × 云台局部姿态。
+  Eigen::Vector3d odom_position = Eigen::Vector3d::Zero();
+  Eigen::Quaterniond odom_rotation = Eigen::Quaterniond::Identity();
+  Eigen::Vector3d gimbal_local_position = Eigen::Vector3d::Zero();
+  Eigen::Quaterniond gimbal_local_rotation = Eigen::Quaterniond::Identity();
+  bool has_odom = false;
+  // 图像帧号 + 与图像接收时刻对齐的位姿样本队列。
+  uint64_t latest_image_id = 0;
+  uint64_t consumed_image_id = 0;
+  struct PoseSample {
+    double recv = 0.0;
+    Eigen::Quaterniond rotation = Eigen::Quaterniond::Identity();
+    Eigen::Vector3d origin = Eigen::Vector3d::Zero();
+  };
+  std::deque<PoseSample> pose_samples;
 };
 
 Bridge& bridge() {
@@ -57,12 +73,27 @@ void onTf(const tf2_msgs::msg::TFMessage::SharedPtr msg) {
     const auto& t = tf.transform.translation;
     const auto& q = tf.transform.rotation;
     if (child == "odom") {
-      // map -> odom：云台在 map 系中的平移就是这里记录的平移。
-      b.gimbal_position = Eigen::Vector3d(t.x, t.y, t.z);
+      b.odom_position = Eigen::Vector3d(t.x, t.y, t.z);
+      b.odom_rotation = Eigen::Quaterniond(q.w, q.x, q.y, q.z);
+      b.has_odom = true;
+      b.gimbal_position = b.odom_position;
     } else if (child == "gimbal_link") {
-      // odom -> gimbal_link：平移为零，旋转为云台姿态。
-      b.gimbal_rotation = Eigen::Quaterniond(q.w, q.x, q.y, q.z);
+      b.gimbal_local_position = Eigen::Vector3d(t.x, t.y, t.z);
+      b.gimbal_local_rotation = Eigen::Quaterniond(q.w, q.x, q.y, q.z);
       b.has_gimbal = true;
+      if (b.has_odom) {
+        const Eigen::Quaterniond base = b.odom_rotation.normalized();
+        Bridge::PoseSample sample;
+        sample.recv = std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        sample.rotation = (base * b.gimbal_local_rotation.normalized()).normalized();
+        sample.origin = b.odom_position + base * b.gimbal_local_position;
+        b.pose_samples.push_back(sample);
+        while (!b.pose_samples.empty() &&
+               sample.recv - b.pose_samples.front().recv > 1.0) {
+          b.pose_samples.pop_front();
+        }
+      }
     } else if (child.rfind("armor_", 0) == 0) {
       b.armor_positions[child] = Eigen::Vector3d(t.x, t.y, t.z);
     }
@@ -89,6 +120,7 @@ void onImage(const sensor_msgs::msg::Image::SharedPtr msg) {
   std::lock_guard<std::mutex> lock(b.mutex);
   b.latest_image = std::move(decoded);
   b.latest_stamp = Clock::now();
+  ++b.latest_image_id;
   b.has_image = true;
 }
 
@@ -98,12 +130,17 @@ std::optional<Eigen::Vector3d> nearestArmorInGimbal(const Eigen::Vector3d& hint)
   Bridge& b = bridge();
   std::lock_guard<std::mutex> lock(b.mutex);
   if (!b.has_gimbal || b.armor_positions.empty()) return std::nullopt;
+  const Eigen::Quaterniond base = b.has_odom ? b.odom_rotation.normalized()
+                                             : Eigen::Quaterniond::Identity();
 
   std::optional<Eigen::Vector3d> best;
   double best_error = 0.0;
   for (const auto& [name, world] : b.armor_positions) {
     (void)name;
-    const Eigen::Vector3d relative = b.gimbal_rotation.inverse() * (world - b.gimbal_position);
+    const Eigen::Quaterniond gimbal_world = (base * b.gimbal_local_rotation).normalized();
+    const Eigen::Vector3d gimbal_world_position =
+        b.odom_position + base * b.gimbal_local_position;
+    const Eigen::Vector3d relative = gimbal_world.inverse() * (world - gimbal_world_position);
     const double error = (relative - hint).norm();
     if (!best || error < best_error) {
       best = relative;
@@ -152,6 +189,9 @@ std::optional<SensorData> IoContext::read() {
   {
     std::lock_guard<std::mutex> lock(b.mutex);
     if (!b.has_image) return std::nullopt;
+    // 没有新帧就不重复处理。
+    if (b.latest_image_id == b.consumed_image_id) return std::nullopt;
+    b.consumed_image_id = b.latest_image_id;
     frame = b.latest_image.clone();
     stamp = b.latest_stamp;
   }
@@ -161,9 +201,27 @@ std::optional<SensorData> IoContext::read() {
   data.timestamp = stamp;
   {
     std::lock_guard<std::mutex> lock(b.mutex);
-    data.imu_q = b.has_gimbal ? b.gimbal_rotation.normalized()
-                              : Eigen::Quaterniond::Identity();
-    data.gimbal_origin = b.gimbal_position;
+    // 取与图像接收时刻最接近的位姿样本（30 ms 内），避免用到过期 TF。
+    const double image_recv =
+        std::chrono::duration<double>(stamp.time_since_epoch()).count();
+    const Bridge::PoseSample* best = nullptr;
+    double best_dt = 1e9;
+    for (const auto& sample : b.pose_samples) {
+      const double dt = std::abs(sample.recv - image_recv);
+      if (dt < best_dt) { best_dt = dt; best = &sample; }
+    }
+    if (best != nullptr && best_dt <= 0.03) {
+      data.imu_q = best->rotation;
+      data.gimbal_origin = best->origin;
+    } else if (b.has_gimbal) {
+      const Eigen::Quaterniond base = b.has_odom ? b.odom_rotation.normalized()
+                                                 : Eigen::Quaterniond::Identity();
+      data.imu_q = (base * b.gimbal_local_rotation.normalized()).normalized();
+      data.gimbal_origin = b.odom_position + base * b.gimbal_local_position;
+    } else {
+      data.imu_q = Eigen::Quaterniond::Identity();
+      data.gimbal_origin = b.odom_position;
+    }
   }
   data.bullet_speed = 25.0;  // 仿真弹速，第四讲预测与第五讲解算使用
   return data;

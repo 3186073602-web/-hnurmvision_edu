@@ -13,6 +13,8 @@ struct Rune {
   double confidence = 0;
 };
 std::vector<Rune> lesson03_rune_detection(const cv::Mat& image);
+void setMinArmorConfidence(float value);
+void setKeepBestArmor(bool value);
 std::optional<Target> lesson04_tracking(const std::vector<Armor>& armors,
     TimePoint timestamp, const Eigen::Quaterniond& imu_q,
     const Eigen::Vector3d& world_origin, const CameraCalibration& calibration,

@@ -1,5 +1,5 @@
 diff --git a/configs/simulation.yaml b/configs/simulation.yaml
-index ae82170..eefc7d3 100644
+index ae82170..aadb1dc 100644
 --- a/configs/simulation.yaml
 +++ b/configs/simulation.yaml
 @@ -1,6 +1,13 @@
@@ -29,7 +29,7 @@ index ae82170..eefc7d3 100644
 -                  0.0, -0.9063077870, 0.4226182617]
 -t_camera2gimbal: [0.0, 0.0, 0.0]
 +                  0.0, -1.0, 0.0]
-+t_camera2gimbal: [0.060, 0.002, 0.158]
++t_camera2gimbal: [0.060, 0.002, 0.196]
 +pose_only: false
 +# 装甲板最低置信度（画面里的 SMALL 0.xx）：低于它的框直接丢弃。
 +min_armor_confidence: 0.62
@@ -44,10 +44,10 @@ index ae82170..eefc7d3 100644
 +# 绝对角瞄准的 pitch 微调（度），用于补偿安装角/标定误差。
 +aim_pitch_trim_deg: 0.0
 diff --git a/include/lessons.hpp b/include/lessons.hpp
-index 86fa46e..480661b 100644
+index 86fa46e..6653bd1 100644
 --- a/include/lessons.hpp
 +++ b/include/lessons.hpp
-@@ -6,7 +6,16 @@
+@@ -6,7 +6,18 @@
  
  namespace training {
  std::vector<Armor> lesson03_detection(const cv::Mat& image);
@@ -58,6 +58,8 @@ index 86fa46e..480661b 100644
 +  double confidence = 0;
 +};
 +std::vector<Rune> lesson03_rune_detection(const cv::Mat& image);
++void setMinArmorConfidence(float value);
++void setKeepBestArmor(bool value);
  std::optional<Target> lesson04_tracking(const std::vector<Armor>& armors,
 -    TimePoint timestamp, const Eigen::Quaterniond& imu_q, const CameraCalibration& calibration, TrackingState& state);
 +    TimePoint timestamp, const Eigen::Quaterniond& imu_q,
@@ -66,10 +68,10 @@ index 86fa46e..480661b 100644
  Command lesson05_aiming(const Target& target, TimePoint timestamp, double bullet_speed);
  }  // namespace training
 diff --git a/include/tracking_state.hpp b/include/tracking_state.hpp
-index 3f3cc22..d91476b 100644
+index 3f3cc22..0925082 100644
 --- a/include/tracking_state.hpp
 +++ b/include/tracking_state.hpp
-@@ -1,8 +1,21 @@
+@@ -1,8 +1,23 @@
  #pragma once
 +#include <Eigen/Geometry>
 +#include <optional>
@@ -89,7 +91,9 @@ index 3f3cc22..d91476b 100644
 +  Eigen::Matrix3d covariance[3] = {
 +      Eigen::Matrix3d::Identity(), Eigen::Matrix3d::Identity(), Eigen::Matrix3d::Identity()};
 +  double last_time_sec = 0.0;
-+  double last_distance = 0.0;  // m，PnP 距离，用于选板
++  double last_distance = 0.0;
++  // 连续丢失帧计数：短时丢失用预测顶住，不立刻清状态。
++  int miss_frames = 0;  // m，PnP 距离，用于选板
  };
  }  // namespace training
 diff --git a/include/types.hpp b/include/types.hpp
@@ -169,10 +173,10 @@ index 04b8637..c1c4115 100644
        1303.6753236814714, 0, 720, 0, 1303.6753236814714, 540, 0, 0, 1};
    std::array<double, 5> distort_coeffs{0, 0, 0, 0, 0};
 diff --git a/lessons/lesson02_io.cpp b/lessons/lesson02_io.cpp
-index a7f8efc..b01440f 100644
+index a7f8efc..deb58bf 100644
 --- a/lessons/lesson02_io.cpp
 +++ b/lessons/lesson02_io.cpp
-@@ -1,20 +1,209 @@
+@@ -1,20 +1,267 @@
  #include "io_context.hpp"
 +
 +#include "vision_gt.hpp"
@@ -184,6 +188,7 @@ index a7f8efc..b01440f 100644
 +#include <sensor_msgs/msg/image.hpp>
 +
  #include <chrono>
++#include <deque>
 +#include <cstdio>
 +#include <map>
 +#include <memory>
@@ -217,6 +222,21 @@ index a7f8efc..b01440f 100644
 +  Eigen::Vector3d gimbal_position = Eigen::Vector3d::Zero();
 +  Eigen::Quaterniond gimbal_rotation = Eigen::Quaterniond::Identity();
 +  bool has_gimbal = false;
++  // 底盘与云台分层的量：云台世界姿态 = 底盘姿态 × 云台局部姿态。
++  Eigen::Vector3d odom_position = Eigen::Vector3d::Zero();
++  Eigen::Quaterniond odom_rotation = Eigen::Quaterniond::Identity();
++  Eigen::Vector3d gimbal_local_position = Eigen::Vector3d::Zero();
++  Eigen::Quaterniond gimbal_local_rotation = Eigen::Quaterniond::Identity();
++  bool has_odom = false;
++  // 图像帧号 + 与图像接收时刻对齐的位姿样本队列。
++  uint64_t latest_image_id = 0;
++  uint64_t consumed_image_id = 0;
++  struct PoseSample {
++    double recv = 0.0;
++    Eigen::Quaterniond rotation = Eigen::Quaterniond::Identity();
++    Eigen::Vector3d origin = Eigen::Vector3d::Zero();
++  };
++  std::deque<PoseSample> pose_samples;
 +};
 +
 +Bridge& bridge() {
@@ -232,12 +252,27 @@ index a7f8efc..b01440f 100644
 +    const auto& t = tf.transform.translation;
 +    const auto& q = tf.transform.rotation;
 +    if (child == "odom") {
-+      // map -> odom：云台在 map 系中的平移就是这里记录的平移。
-+      b.gimbal_position = Eigen::Vector3d(t.x, t.y, t.z);
++      b.odom_position = Eigen::Vector3d(t.x, t.y, t.z);
++      b.odom_rotation = Eigen::Quaterniond(q.w, q.x, q.y, q.z);
++      b.has_odom = true;
++      b.gimbal_position = b.odom_position;
 +    } else if (child == "gimbal_link") {
-+      // odom -> gimbal_link：平移为零，旋转为云台姿态。
-+      b.gimbal_rotation = Eigen::Quaterniond(q.w, q.x, q.y, q.z);
++      b.gimbal_local_position = Eigen::Vector3d(t.x, t.y, t.z);
++      b.gimbal_local_rotation = Eigen::Quaterniond(q.w, q.x, q.y, q.z);
 +      b.has_gimbal = true;
++      if (b.has_odom) {
++        const Eigen::Quaterniond base = b.odom_rotation.normalized();
++        Bridge::PoseSample sample;
++        sample.recv = std::chrono::duration<double>(
++            std::chrono::steady_clock::now().time_since_epoch()).count();
++        sample.rotation = (base * b.gimbal_local_rotation.normalized()).normalized();
++        sample.origin = b.odom_position + base * b.gimbal_local_position;
++        b.pose_samples.push_back(sample);
++        while (!b.pose_samples.empty() &&
++               sample.recv - b.pose_samples.front().recv > 1.0) {
++          b.pose_samples.pop_front();
++        }
++      }
 +    } else if (child.rfind("armor_", 0) == 0) {
 +      b.armor_positions[child] = Eigen::Vector3d(t.x, t.y, t.z);
 +    }
@@ -264,6 +299,7 @@ index a7f8efc..b01440f 100644
 +  std::lock_guard<std::mutex> lock(b.mutex);
 +  b.latest_image = std::move(decoded);
 +  b.latest_stamp = Clock::now();
++  ++b.latest_image_id;
 +  b.has_image = true;
 +}
 +
@@ -273,12 +309,17 @@ index a7f8efc..b01440f 100644
 +  Bridge& b = bridge();
 +  std::lock_guard<std::mutex> lock(b.mutex);
 +  if (!b.has_gimbal || b.armor_positions.empty()) return std::nullopt;
++  const Eigen::Quaterniond base = b.has_odom ? b.odom_rotation.normalized()
++                                             : Eigen::Quaterniond::Identity();
 +
 +  std::optional<Eigen::Vector3d> best;
 +  double best_error = 0.0;
 +  for (const auto& [name, world] : b.armor_positions) {
 +    (void)name;
-+    const Eigen::Vector3d relative = b.gimbal_rotation.inverse() * (world - b.gimbal_position);
++    const Eigen::Quaterniond gimbal_world = (base * b.gimbal_local_rotation).normalized();
++    const Eigen::Vector3d gimbal_world_position =
++        b.odom_position + base * b.gimbal_local_position;
++    const Eigen::Vector3d relative = gimbal_world.inverse() * (world - gimbal_world_position);
 +    const double error = (relative - hint).norm();
 +    if (!best || error < best_error) {
 +      best = relative;
@@ -329,6 +370,9 @@ index a7f8efc..b01440f 100644
 +  {
 +    std::lock_guard<std::mutex> lock(b.mutex);
 +    if (!b.has_image) return std::nullopt;
++    // 没有新帧就不重复处理。
++    if (b.latest_image_id == b.consumed_image_id) return std::nullopt;
++    b.consumed_image_id = b.latest_image_id;
 +    frame = b.latest_image.clone();
 +    stamp = b.latest_stamp;
 +  }
@@ -338,9 +382,27 @@ index a7f8efc..b01440f 100644
 +  data.timestamp = stamp;
 +  {
 +    std::lock_guard<std::mutex> lock(b.mutex);
-+    data.imu_q = b.has_gimbal ? b.gimbal_rotation.normalized()
-+                              : Eigen::Quaterniond::Identity();
-+    data.gimbal_origin = b.gimbal_position;
++    // 取与图像接收时刻最接近的位姿样本（30 ms 内），避免用到过期 TF。
++    const double image_recv =
++        std::chrono::duration<double>(stamp.time_since_epoch()).count();
++    const Bridge::PoseSample* best = nullptr;
++    double best_dt = 1e9;
++    for (const auto& sample : b.pose_samples) {
++      const double dt = std::abs(sample.recv - image_recv);
++      if (dt < best_dt) { best_dt = dt; best = &sample; }
++    }
++    if (best != nullptr && best_dt <= 0.03) {
++      data.imu_q = best->rotation;
++      data.gimbal_origin = best->origin;
++    } else if (b.has_gimbal) {
++      const Eigen::Quaterniond base = b.has_odom ? b.odom_rotation.normalized()
++                                                 : Eigen::Quaterniond::Identity();
++      data.imu_q = (base * b.gimbal_local_rotation.normalized()).normalized();
++      data.gimbal_origin = b.odom_position + base * b.gimbal_local_position;
++    } else {
++      data.imu_q = Eigen::Quaterniond::Identity();
++      data.gimbal_origin = b.odom_position;
++    }
 +  }
 +  data.bullet_speed = 25.0;  // 仿真弹速，第四讲预测与第五讲解算使用
 +  return data;
@@ -851,10 +913,10 @@ index c9cbbd8..b7587d5 100644
  }
  }  // namespace training
 diff --git a/lessons/lesson04_tracking.cpp b/lessons/lesson04_tracking.cpp
-index d0a03a2..8a55a79 100644
+index d0a03a2..24a8c42 100644
 --- a/lessons/lesson04_tracking.cpp
 +++ b/lessons/lesson04_tracking.cpp
-@@ -1,28 +1,219 @@
+@@ -1,28 +1,233 @@
  #include "lessons.hpp"
  
 +#include <opencv2/calib3d.hpp>
@@ -1034,9 +1096,23 @@ index d0a03a2..8a55a79 100644
 +  }
 +
 +  if (!found) {
++    // 短时丢失：保持滤波状态，用上一帧速度和加速度外推，最多顶 150 ms。
++    // 超过之后才判定目标丢失，避免一帧漏检就把状态清空、云台跟着乱跳。
++    const double now = std::chrono::duration<double>(timestamp.time_since_epoch()).count();
++    const double gap = state.last_time_sec > 0.0 ? now - state.last_time_sec : 1e9;
++    if (state.valid && gap < 0.15 && ++state.miss_frames <= 8) {
++      Target held;
++      held.position = state.position + state.velocity * gap +
++                      0.5 * state.acceleration * gap * gap - world_origin;
++      held.velocity = state.velocity;
++      held.acceleration = state.acceleration;
++      return held;
++    }
 +    state.valid = false;
++    state.miss_frames = 0;
 +    return std::nullopt;
 +  }
++  state.miss_frames = 0;
 +
 +  // 常加速度卡尔曼：先用上一帧状态预测，再用 PnP 位置更新。
 +  Eigen::Vector3d position = best_position;
@@ -1176,7 +1252,7 @@ index bb2b357..ba7efc3 100644
  }
  }  // namespace training
 diff --git a/src/main.cpp b/src/main.cpp
-index 4a7bf8c..45a5c0b 100644
+index 4a7bf8c..63e3fd4 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
 @@ -1,12 +1,106 @@
@@ -1286,7 +1362,7 @@ index 4a7bf8c..45a5c0b 100644
  
  int main(int argc, char** argv) {
    std::signal(SIGINT, on_signal);
-@@ -17,21 +111,130 @@ int main(int argc, char** argv) {
+@@ -17,21 +111,145 @@ int main(int argc, char** argv) {
    training::TrackingState tracking;
    devices.open();
  
@@ -1325,6 +1401,21 @@ index 4a7bf8c..45a5c0b 100644
 +          armors, input->timestamp, input->imu_q, input->gimbal_origin, calibration, tracking);
 +      if (target) {
          command = training::lesson05_aiming(*target, input->timestamp, input->bullet_speed);
++        if (std::getenv("AIM_DEBUG") != nullptr && armors.size() == 1) {
++          const Eigen::Vector3d relative = input->imu_q.inverse() * target->position;
++          if (const auto gt = training::io::nearestArmorInGimbal(relative)) {
++            const Eigen::Vector3d gt_world = input->imu_q * (*gt);
++            const double cmd_yaw = command.yaw * 180.0 / training::kPi;
++            const double gt_yaw = std::atan2(gt_world.y(), gt_world.x()) * 180.0 / training::kPi;
++            const double dx = target->position.x(), dy = target->position.y();
++            const double pnp_yaw = std::atan2(dy, dx) * 180.0 / training::kPi;
++            static int dbg = 0;
++            if (++dbg % 25 == 0) {
++              std::fprintf(stderr, "[aim] cmd=%.1f pnp=%.1f gt=%.1f err=%.1f\n",
++                           cmd_yaw, pnp_yaw, gt_yaw, gt_yaw - cmd_yaw);
++            }
++          }
++        }
 +        // 火控：有解且允许开火时持续请求发射；云台对齐后弹丸自然命中。
 +        if (command.control && devices.config.allow_fire) command.shoot = true;
 +

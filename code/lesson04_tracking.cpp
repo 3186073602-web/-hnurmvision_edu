@@ -157,9 +157,23 @@ std::optional<Target> lesson04_tracking(const std::vector<Armor>& armors,
   }
 
   if (!found) {
+    // 短时丢失：保持滤波状态，用上一帧速度和加速度外推，最多顶 150 ms。
+    // 超过之后才判定目标丢失，避免一帧漏检就把状态清空、云台跟着乱跳。
+    const double now = std::chrono::duration<double>(timestamp.time_since_epoch()).count();
+    const double gap = state.last_time_sec > 0.0 ? now - state.last_time_sec : 1e9;
+    if (state.valid && gap < 0.15 && ++state.miss_frames <= 8) {
+      Target held;
+      held.position = state.position + state.velocity * gap +
+                      0.5 * state.acceleration * gap * gap - world_origin;
+      held.velocity = state.velocity;
+      held.acceleration = state.acceleration;
+      return held;
+    }
     state.valid = false;
+    state.miss_frames = 0;
     return std::nullopt;
   }
+  state.miss_frames = 0;
 
   // 常加速度卡尔曼：先用上一帧状态预测，再用 PnP 位置更新。
   Eigen::Vector3d position = best_position;

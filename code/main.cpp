@@ -143,6 +143,21 @@ int main(int argc, char** argv) {
           armors, input->timestamp, input->imu_q, input->gimbal_origin, calibration, tracking);
       if (target) {
         command = training::lesson05_aiming(*target, input->timestamp, input->bullet_speed);
+        if (std::getenv("AIM_DEBUG") != nullptr && armors.size() == 1) {
+          const Eigen::Vector3d relative = input->imu_q.inverse() * target->position;
+          if (const auto gt = training::io::nearestArmorInGimbal(relative)) {
+            const Eigen::Vector3d gt_world = input->imu_q * (*gt);
+            const double cmd_yaw = command.yaw * 180.0 / training::kPi;
+            const double gt_yaw = std::atan2(gt_world.y(), gt_world.x()) * 180.0 / training::kPi;
+            const double dx = target->position.x(), dy = target->position.y();
+            const double pnp_yaw = std::atan2(dy, dx) * 180.0 / training::kPi;
+            static int dbg = 0;
+            if (++dbg % 25 == 0) {
+              std::fprintf(stderr, "[aim] cmd=%.1f pnp=%.1f gt=%.1f err=%.1f\n",
+                           cmd_yaw, pnp_yaw, gt_yaw, gt_yaw - cmd_yaw);
+            }
+          }
+        }
         // 火控：有解且允许开火时持续请求发射；云台对齐后弹丸自然命中。
         if (command.control && devices.config.allow_fire) command.shoot = true;
 
