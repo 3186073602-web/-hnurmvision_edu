@@ -30,7 +30,7 @@ constexpr float kMaxBarWidth = 90.0F;     // px，太宽的多半是车体反光
 constexpr double kMinBarArea = 22.0;      // px^2（远距离灯条只有二十几像素）
 
 // 灯条配对的几何约束。
-constexpr float kMaxHeightDiff = 0.40F;   // 两条灯条高度差 / 较高者
+constexpr float kMaxHeightDiff = 0.25F;   // 两条灯条高度差 / 较高者（收紧，排除车壳亮边）
 constexpr float kMaxCenterOffset = 0.42F; // 竖直中心差 / 平均灯条高度
 constexpr float kMaxTiltDiff = 20.0F;     // 倾斜角差，单位度
 constexpr float kMinGapRatio = 0.28F;     // 灯条净间距 / 平均灯条高度
@@ -164,6 +164,8 @@ std::vector<Armor> lesson03_detection(const cv::Mat& image) {
 
   cv::Mat blue_mask, red_mask;
   buildColorMasks(hsv, blue_mask, red_mask);
+  cv::Mat color_mask;
+  cv::bitwise_or(blue_mask, red_mask, color_mask);
 
   std::vector<LightBar> bars = findLightBars(blue_mask, 0);
   std::vector<LightBar> red_bars = findLightBars(red_mask, 1);
@@ -211,6 +213,22 @@ std::vector<Armor> lesson03_detection(const cv::Mat& image) {
       if (box.height <= 1.0F) continue;
       const float aspect = box.width / box.height;
       if (aspect < kMinArmorAspect || aspect > kMaxArmorAspect) continue;
+
+      // 板面检查：真装甲板中间是“暗底 + 数字”，两条灯条只贴在左右边缘。
+      // 如果框的中部还出现灯条颜色（说明这个框把另一块真板包了进去，
+      // 典型是整车侧面被当成一块板），直接排除。
+      if (!color_mask.empty()) {
+        const int x0 = std::max(0, static_cast<int>(box.x + box.width * 0.30F));
+        const int x1 = std::min(color_mask.cols, static_cast<int>(box.x + box.width * 0.70F));
+        const int y0 = std::max(0, static_cast<int>(box.y + box.height * 0.15F));
+        const int y1 = std::min(color_mask.rows, static_cast<int>(box.y + box.height * 0.85F));
+        if (x1 > x0 && y1 > y0) {
+          const cv::Rect middle(x0, y0, x1 - x0, y1 - y0);
+          const double colored = cv::countNonZero(color_mask(middle));
+          const double fraction = colored / static_cast<double>(middle.area());
+          if (fraction > 0.12) continue;  // 中部有灯条颜色 → 不是一块板
+        }
+      }
 
       // 置信度由“高度一致 / 倾斜一致 / 间距合理”三项加权，作为后续跟踪的
       // 观测权重，也用于视频里的可视化。
@@ -276,6 +294,15 @@ std::vector<Armor> lesson03_detection(const cv::Mat& image) {
       }
     }
     if (!duplicate) kept.push_back(armor);
+  }
+  if (std::getenv("LESSON03_DEBUG") != nullptr) {
+    std::fprintf(stderr, "[det-final] n=%zu", kept.size());
+    for (const auto& armor : kept) {
+      const cv::Rect2f box = cv::boundingRect(armor.corners);
+      std::fprintf(stderr, " (%.0f,%.0f,%.0fx%.0f c=%.2f)",
+                   box.x, box.y, box.width, box.height, armor.confidence);
+    }
+    std::fprintf(stderr, "\n");
   }
   return kept;
 }
