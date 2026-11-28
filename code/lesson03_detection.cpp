@@ -260,6 +260,16 @@ std::vector<Armor> lesson03_detection(const cv::Mat& image) {
       const float inter_area = std::max(0.0F, inter.width) * std::max(0.0F, inter.height);
       const float min_area = std::min(box.area(), other_box.area());
       const bool contained = min_area > 1.0F && inter_area / min_area > 0.6F;
+      if (std::getenv("LESSON03_DEBUG") != nullptr) {
+        std::fprintf(stderr,
+                     "[det] box=(%.0f,%.0f,%.0fx%.0f) conf=%.2f other=(%.0f,%.0f,%.0fx%.0f) "
+                     "conf=%.2f iou=%.2f near=%d contained=%.2f\n",
+                     box.x, box.y, box.width, box.height, armor.confidence,
+                     other_box.x, other_box.y, other_box.width, other_box.height,
+                     other.confidence, iou(armor.corners, other.corners),
+                     static_cast<int>(near_duplicate),
+                     min_area > 1.0F ? inter_area / min_area : 0.0F);
+      }
       if (iou(armor.corners, other.corners) > kSuppressIou || near_duplicate || contained) {
         duplicate = true;
         break;

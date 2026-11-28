@@ -475,10 +475,10 @@ index a7f8efc..a2a7e3f 100644
  }
  }  // namespace training::io
 diff --git a/lessons/lesson03_detection.cpp b/lessons/lesson03_detection.cpp
-index c9cbbd8..9a0527f 100644
+index c9cbbd8..4e96567 100644
 --- a/lessons/lesson03_detection.cpp
 +++ b/lessons/lesson03_detection.cpp
-@@ -1,13 +1,358 @@
+@@ -1,13 +1,368 @@
  #include "lessons.hpp"
  
 +#include <opencv2/imgproc.hpp>
@@ -748,6 +748,16 @@ index c9cbbd8..9a0527f 100644
 +      const float inter_area = std::max(0.0F, inter.width) * std::max(0.0F, inter.height);
 +      const float min_area = std::min(box.area(), other_box.area());
 +      const bool contained = min_area > 1.0F && inter_area / min_area > 0.6F;
++      if (std::getenv("LESSON03_DEBUG") != nullptr) {
++        std::fprintf(stderr,
++                     "[det] box=(%.0f,%.0f,%.0fx%.0f) conf=%.2f other=(%.0f,%.0f,%.0fx%.0f) "
++                     "conf=%.2f iou=%.2f near=%d contained=%.2f\n",
++                     box.x, box.y, box.width, box.height, armor.confidence,
++                     other_box.x, other_box.y, other_box.width, other_box.height,
++                     other.confidence, iou(armor.corners, other.corners),
++                     static_cast<int>(near_duplicate),
++                     min_area > 1.0F ? inter_area / min_area : 0.0F);
++      }
 +      if (iou(armor.corners, other.corners) > kSuppressIou || near_duplicate || contained) {
 +        duplicate = true;
 +        break;
