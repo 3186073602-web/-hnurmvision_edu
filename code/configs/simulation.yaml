@@ -6,6 +6,8 @@ allow_fire: true
 enable_rune: false
 # 是否显示 250ms 预测框和预测误差（调试用）
 show_prediction: false
+# 独立位姿测量调试：打印帧号/延迟/TF 对齐误差（默认关闭）
+show_diagnostics: false
 
 # 仿真环境下的相机内参
 camera_matrix: [1303.6753236814714, 0.0, 720.0,
@@ -21,3 +23,4 @@ R_camera2gimbal: [0.0, 0.0, 1.0,
                   -1.0, 0.0, 0.0,
                   0.0, -1.0, 0.0]
 t_camera2gimbal: [0.060, 0.002, 0.158]
+pose_only: false

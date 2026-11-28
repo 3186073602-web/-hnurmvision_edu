@@ -9,6 +9,7 @@
 #include <sensor_msgs/msg/image.hpp>
 
 #include <chrono>
+#include <deque>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -49,6 +50,26 @@ struct Bridge {
   Eigen::Quaterniond gimbal_local_rotation = Eigen::Quaterniond::Identity();
   bool has_odom = false;
   bool has_gimbal = false;
+  // 图像帧号与时间戳：用来发现重复帧、对齐 TF。
+  uint64_t latest_image_id = 0;
+  uint64_t consumed_image_id = 0;
+  double latest_image_stamp = 0.0;
+  struct PoseSample {
+    double stamp = 0.0;   // ROS 时间戳（诊断用）
+    double recv = 0.0;    // 接收时刻（steady 时钟，用于和图像对齐）
+    Eigen::Quaterniond rotation = Eigen::Quaterniond::Identity();       // 云台世界姿态
+    Eigen::Vector3d origin = Eigen::Vector3d::Zero();                    // 云台世界位置
+    Eigen::Quaterniond camera_rotation = Eigen::Quaterniond::Identity(); // 相机世界姿态
+    Eigen::Vector3d camera_origin = Eigen::Vector3d::Zero();             // 相机世界位置
+    bool has_camera = false;
+  };
+  // 相机链的局部量：gimbal_link -> camera_link -> camera_optical_frame
+  Eigen::Vector3d camera_link_translation = Eigen::Vector3d::Zero();
+  Eigen::Quaterniond camera_link_rotation = Eigen::Quaterniond::Identity();
+  Eigen::Vector3d optical_translation = Eigen::Vector3d::Zero();
+  Eigen::Quaterniond optical_rotation = Eigen::Quaterniond::Identity();
+  bool has_camera_chain = false;
+  std::deque<PoseSample> pose_samples;
 };
 
 Bridge& bridge() {
@@ -74,6 +95,38 @@ void onTf(const tf2_msgs::msg::TFMessage::SharedPtr msg) {
       b.gimbal_local_position = Eigen::Vector3d(t.x, t.y, t.z);
       b.gimbal_local_rotation = Eigen::Quaterniond(q.w, q.x, q.y, q.z);
       b.has_gimbal = true;
+      if (b.has_odom) {
+        const Eigen::Quaterniond base = b.odom_rotation.normalized();
+        Bridge::PoseSample sample;
+        sample.stamp = static_cast<double>(tf.header.stamp.sec) +
+                       static_cast<double>(tf.header.stamp.nanosec) * 1e-9;
+        sample.recv = std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        sample.rotation = (base * b.gimbal_local_rotation.normalized()).normalized();
+        sample.origin = b.odom_position + base * b.gimbal_local_position;
+        if (b.has_camera_chain) {
+          // 相机世界位姿 = 云台世界位姿 × (camera_link × optical)
+          const Eigen::Quaterniond rel_rotation =
+              (b.camera_link_rotation * b.optical_rotation).normalized();
+          const Eigen::Vector3d rel_translation =
+              b.camera_link_translation + b.camera_link_rotation * b.optical_translation;
+          sample.camera_rotation = (sample.rotation * rel_rotation).normalized();
+          sample.camera_origin = sample.origin + sample.rotation * rel_translation;
+          sample.has_camera = true;
+        }
+        b.pose_samples.push_back(sample);
+        while (!b.pose_samples.empty() &&
+               sample.stamp - b.pose_samples.front().stamp > 1.0) {
+          b.pose_samples.pop_front();
+        }
+      }
+    } else if (child == "camera_link") {
+      b.camera_link_translation = Eigen::Vector3d(t.x, t.y, t.z);
+      b.camera_link_rotation = Eigen::Quaterniond(q.w, q.x, q.y, q.z);
+    } else if (child == "camera_optical_frame") {
+      b.optical_translation = Eigen::Vector3d(t.x, t.y, t.z);
+      b.optical_rotation = Eigen::Quaterniond(q.w, q.x, q.y, q.z);
+      b.has_camera_chain = true;
     } else if (child.rfind("armor_", 0) == 0) {
       b.armor_positions[child] = Eigen::Vector3d(t.x, t.y, t.z);
     }
@@ -100,6 +153,9 @@ void onImage(const sensor_msgs::msg::Image::SharedPtr msg) {
   std::lock_guard<std::mutex> lock(b.mutex);
   b.latest_image = std::move(decoded);
   b.latest_stamp = Clock::now();
+  ++b.latest_image_id;
+  b.latest_image_stamp = static_cast<double>(msg->header.stamp.sec) +
+                         static_cast<double>(msg->header.stamp.nanosec) * 1e-9;
   b.has_image = true;
 }
 
@@ -160,26 +216,59 @@ std::optional<SensorData> IoContext::read() {
 
   cv::Mat frame;
   TimePoint stamp;
+  uint64_t image_id = 0;
+  double image_stamp = 0.0;
   {
     std::lock_guard<std::mutex> lock(b.mutex);
     if (!b.has_image) return std::nullopt;
+    // 没有新帧就直接返回，避免同一帧被处理两次。
+    if (b.latest_image_id == b.consumed_image_id) return std::nullopt;
+    b.consumed_image_id = b.latest_image_id;
     frame = b.latest_image.clone();
     stamp = b.latest_stamp;
+    image_id = b.latest_image_id;
+    image_stamp = b.latest_image_stamp;
   }
 
   SensorData data;
   data.image = std::move(frame);
   data.timestamp = stamp;
+  data.image_id = image_id;
+  data.image_stamp = image_stamp;
   {
     std::lock_guard<std::mutex> lock(b.mutex);
-    if (b.has_gimbal) {
+    // 优先用与图像采集时刻最接近的 TF 样本（50 ms 内），否则退回最新值。
+    const double image_recv = std::chrono::duration<double>(stamp.time_since_epoch()).count();
+    const Bridge::PoseSample* best = nullptr;
+    double best_dt = 1e9;
+    for (const auto& sample : b.pose_samples) {
+      const double dt = std::abs(sample.recv - image_recv);
+      if (dt < best_dt) {
+        best_dt = dt;
+        best = &sample;
+      }
+    }
+    if (best != nullptr && best_dt <= 0.03) {
+      data.imu_q = best->rotation;
+      data.gimbal_origin = best->origin;
+      data.tf_stamp = best->stamp;
+      data.tf_sync_ms = (best->recv - image_recv) * 1000.0;
+      data.tf_interpolated = best_dt > 0.01;
+      if (best->has_camera) {
+        data.camera_to_world = best->camera_rotation;
+        data.camera_origin = best->camera_origin;
+        data.has_camera_pose = true;
+      }
+    } else if (b.has_gimbal) {
       const Eigen::Quaterniond base = b.has_odom ? b.odom_rotation.normalized()
                                                  : Eigen::Quaterniond::Identity();
       data.imu_q = (base * b.gimbal_local_rotation.normalized()).normalized();
       data.gimbal_origin = b.odom_position + base * b.gimbal_local_position;
+      data.tf_interpolated = true;
     } else {
       data.imu_q = Eigen::Quaterniond::Identity();
       data.gimbal_origin = b.odom_position;
+      data.tf_interpolated = true;
     }
   }
   data.bullet_speed = 25.0;  // 仿真弹速，第四讲预测与第五讲解算使用

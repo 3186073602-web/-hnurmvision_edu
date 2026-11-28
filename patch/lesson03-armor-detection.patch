@@ -1,8 +1,8 @@
 diff --git a/configs/simulation.yaml b/configs/simulation.yaml
-index ae82170..0a85026 100644
+index ae82170..de5c78e 100644
 --- a/configs/simulation.yaml
 +++ b/configs/simulation.yaml
-@@ -1,6 +1,11 @@
+@@ -1,6 +1,13 @@
  # 只需要修改显示、发射许可和相机标定。
  display: true
 -allow_fire: false
@@ -12,10 +12,12 @@ index ae82170..0a85026 100644
 +enable_rune: false
 +# 是否显示 250ms 预测框和预测误差（调试用）
 +show_prediction: false
++# 独立位姿测量调试：打印帧号/延迟/TF 对齐误差（默认关闭）
++show_diagnostics: false
  
  # 仿真环境下的相机内参
  camera_matrix: [1303.6753236814714, 0.0, 720.0,
-@@ -10,7 +15,9 @@ distort_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
+@@ -10,7 +17,10 @@ distort_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
  
  # 相机光学坐标系到云台坐标系：p_gimbal = R * p_camera + t。
  # vehicle.glb 中相机/枪口固定仰角为 25°。
@@ -28,11 +30,12 @@ index ae82170..0a85026 100644
 -t_camera2gimbal: [0.0, 0.0, 0.0]
 +                  0.0, -1.0, 0.0]
 +t_camera2gimbal: [0.060, 0.002, 0.158]
++pose_only: false
 diff --git a/include/lessons.hpp b/include/lessons.hpp
-index 86fa46e..480661b 100644
+index 86fa46e..8ed4607 100644
 --- a/include/lessons.hpp
 +++ b/include/lessons.hpp
-@@ -6,7 +6,16 @@
+@@ -6,7 +6,17 @@
  
  namespace training {
  std::vector<Armor> lesson03_detection(const cv::Mat& image);
@@ -46,7 +49,8 @@ index 86fa46e..480661b 100644
  std::optional<Target> lesson04_tracking(const std::vector<Armor>& armors,
 -    TimePoint timestamp, const Eigen::Quaterniond& imu_q, const CameraCalibration& calibration, TrackingState& state);
 +    TimePoint timestamp, const Eigen::Quaterniond& imu_q,
-+    const Eigen::Vector3d& world_origin, const CameraCalibration& calibration,
++    const Eigen::Vector3d& world_origin, const Eigen::Quaterniond& camera_to_world,
++    const Eigen::Vector3d& camera_origin, const CameraCalibration& calibration,
 +    TrackingState& state);
  Command lesson05_aiming(const Target& target, TimePoint timestamp, double bullet_speed);
  }  // namespace training
@@ -80,18 +84,30 @@ index 3f3cc22..7bcec96 100644
  };
  }  // namespace training
 diff --git a/include/types.hpp b/include/types.hpp
-index 53d64e7..d5f728d 100644
+index 53d64e7..75d139e 100644
 --- a/include/types.hpp
 +++ b/include/types.hpp
-@@ -23,6 +23,7 @@ struct SensorData {
+@@ -23,7 +23,19 @@ struct SensorData {
    cv::Mat image;  // CV_8UC3，BGR，独立拥有像素内存
    TimePoint timestamp{};
    Eigen::Quaterniond imu_q = Eigen::Quaterniond::Identity();
 +  Eigen::Vector3d gimbal_origin = Eigen::Vector3d::Zero();
    double bullet_speed = 0;  // m/s
++
++  // —— 数据同步诊断（不参与算法，只用于排查时间/重复帧问题）——
++  uint64_t image_id = 0;       // 每帧唯一，用来发现重复处理
++  double image_stamp = 0.0;    // 图像在 ROS 时钟下的采集时间，s
++  double tf_stamp = 0.0;       // 所用 TF 样本的 ROS 时间戳，s
++  double tf_sync_ms = 0.0;     // TF 与图像在“接收时刻”上的差，ms（同一 steady 时钟）
++  bool tf_interpolated = false;// 是否用了“最近邻”而不是严格同刻 TF
++  // 相机光学系在世界系中的位姿（由 TF 链直接给出，不依赖相机→云台外参）。
++  Eigen::Quaterniond camera_to_world = Eigen::Quaterniond::Identity();
++  Eigen::Vector3d camera_origin = Eigen::Vector3d::Zero();
++  bool has_camera_pose = false;
  };
  
-@@ -38,6 +39,9 @@ struct Armor {
+ // 第三讲输出：一块装甲板的图像观测。
+@@ -38,6 +50,9 @@ struct Armor {
  struct Target {
    Eigen::Vector3d position = Eigen::Vector3d::Zero();  // m，IMU稳定系中相对云台原点的目标向量
    Eigen::Vector3d velocity = Eigen::Vector3d::Zero();  // m/s，同一坐标系
@@ -102,23 +118,25 @@ index 53d64e7..d5f728d 100644
  
  // 第五讲输出：绝对角使用 rad，IO 边界统一转换单位和方向。
 diff --git a/io/config.cpp b/io/config.cpp
-index 7746963..855cd03 100644
+index 7746963..df5a9d8 100644
 --- a/io/config.cpp
 +++ b/io/config.cpp
-@@ -24,6 +24,8 @@ Config load_config(const std::string& path) {
+@@ -24,6 +24,10 @@ Config load_config(const std::string& path) {
    Config c;
    if (y["display"]) c.display = y["display"].as<bool>();
    if (y["allow_fire"]) c.allow_fire = y["allow_fire"].as<bool>();
 +  if (y["enable_rune"]) c.enable_rune = y["enable_rune"].as<bool>();
 +  if (y["show_prediction"]) c.show_prediction = y["show_prediction"].as<bool>();
++  if (y["show_diagnostics"]) c.show_diagnostics = y["show_diagnostics"].as<bool>();
++  if (y["pose_only"]) c.pose_only = y["pose_only"].as<bool>();
    read_array(y, "camera_matrix", c.camera_matrix);
    read_array(y, "distort_coeffs", c.distort_coeffs);
    read_array(y, "R_camera2gimbal", c.camera_to_gimbal);
 diff --git a/io/config.hpp b/io/config.hpp
-index 04b8637..fa547a0 100644
+index 04b8637..e8e010b 100644
 --- a/io/config.hpp
 +++ b/io/config.hpp
-@@ -6,6 +6,10 @@ namespace training {
+@@ -6,6 +6,14 @@ namespace training {
  struct Config {
    bool display = true;
    bool allow_fire = false;
@@ -126,14 +144,18 @@ index 04b8637..fa547a0 100644
 +  bool enable_rune = false;
 +  // 是否画 250ms 预测框与预测误差（调试用，默认关闭）。
 +  bool show_prediction = false;
++  // 独立位姿测量调试模式：打印帧号、采集/处理延迟、TF 对齐误差、PnP 位置。
++  bool show_diagnostics = false;
++  // 独立位姿测量模式：只算 PnP/跟踪，不向云台发任何指令（用于评估位姿稳定性）。
++  bool pose_only = false;
    std::array<double, 9> camera_matrix{
        1303.6753236814714, 0, 720, 0, 1303.6753236814714, 540, 0, 0, 1};
    std::array<double, 5> distort_coeffs{0, 0, 0, 0, 0};
 diff --git a/lessons/lesson02_io.cpp b/lessons/lesson02_io.cpp
-index a7f8efc..bb86362 100644
+index a7f8efc..a2a7e3f 100644
 --- a/lessons/lesson02_io.cpp
 +++ b/lessons/lesson02_io.cpp
-@@ -1,20 +1,226 @@
+@@ -1,20 +1,315 @@
  #include "io_context.hpp"
 +
 +#include "vision_gt.hpp"
@@ -145,6 +167,7 @@ index a7f8efc..bb86362 100644
 +#include <sensor_msgs/msg/image.hpp>
 +
  #include <chrono>
++#include <deque>
 +#include <cstdio>
 +#include <map>
 +#include <memory>
@@ -185,6 +208,26 @@ index a7f8efc..bb86362 100644
 +  Eigen::Quaterniond gimbal_local_rotation = Eigen::Quaterniond::Identity();
 +  bool has_odom = false;
 +  bool has_gimbal = false;
++  // 图像帧号与时间戳：用来发现重复帧、对齐 TF。
++  uint64_t latest_image_id = 0;
++  uint64_t consumed_image_id = 0;
++  double latest_image_stamp = 0.0;
++  struct PoseSample {
++    double stamp = 0.0;   // ROS 时间戳（诊断用）
++    double recv = 0.0;    // 接收时刻（steady 时钟，用于和图像对齐）
++    Eigen::Quaterniond rotation = Eigen::Quaterniond::Identity();       // 云台世界姿态
++    Eigen::Vector3d origin = Eigen::Vector3d::Zero();                    // 云台世界位置
++    Eigen::Quaterniond camera_rotation = Eigen::Quaterniond::Identity(); // 相机世界姿态
++    Eigen::Vector3d camera_origin = Eigen::Vector3d::Zero();             // 相机世界位置
++    bool has_camera = false;
++  };
++  // 相机链的局部量：gimbal_link -> camera_link -> camera_optical_frame
++  Eigen::Vector3d camera_link_translation = Eigen::Vector3d::Zero();
++  Eigen::Quaterniond camera_link_rotation = Eigen::Quaterniond::Identity();
++  Eigen::Vector3d optical_translation = Eigen::Vector3d::Zero();
++  Eigen::Quaterniond optical_rotation = Eigen::Quaterniond::Identity();
++  bool has_camera_chain = false;
++  std::deque<PoseSample> pose_samples;
 +};
 +
 +Bridge& bridge() {
@@ -210,6 +253,38 @@ index a7f8efc..bb86362 100644
 +      b.gimbal_local_position = Eigen::Vector3d(t.x, t.y, t.z);
 +      b.gimbal_local_rotation = Eigen::Quaterniond(q.w, q.x, q.y, q.z);
 +      b.has_gimbal = true;
++      if (b.has_odom) {
++        const Eigen::Quaterniond base = b.odom_rotation.normalized();
++        Bridge::PoseSample sample;
++        sample.stamp = static_cast<double>(tf.header.stamp.sec) +
++                       static_cast<double>(tf.header.stamp.nanosec) * 1e-9;
++        sample.recv = std::chrono::duration<double>(
++            std::chrono::steady_clock::now().time_since_epoch()).count();
++        sample.rotation = (base * b.gimbal_local_rotation.normalized()).normalized();
++        sample.origin = b.odom_position + base * b.gimbal_local_position;
++        if (b.has_camera_chain) {
++          // 相机世界位姿 = 云台世界位姿 × (camera_link × optical)
++          const Eigen::Quaterniond rel_rotation =
++              (b.camera_link_rotation * b.optical_rotation).normalized();
++          const Eigen::Vector3d rel_translation =
++              b.camera_link_translation + b.camera_link_rotation * b.optical_translation;
++          sample.camera_rotation = (sample.rotation * rel_rotation).normalized();
++          sample.camera_origin = sample.origin + sample.rotation * rel_translation;
++          sample.has_camera = true;
++        }
++        b.pose_samples.push_back(sample);
++        while (!b.pose_samples.empty() &&
++               sample.stamp - b.pose_samples.front().stamp > 1.0) {
++          b.pose_samples.pop_front();
++        }
++      }
++    } else if (child == "camera_link") {
++      b.camera_link_translation = Eigen::Vector3d(t.x, t.y, t.z);
++      b.camera_link_rotation = Eigen::Quaterniond(q.w, q.x, q.y, q.z);
++    } else if (child == "camera_optical_frame") {
++      b.optical_translation = Eigen::Vector3d(t.x, t.y, t.z);
++      b.optical_rotation = Eigen::Quaterniond(q.w, q.x, q.y, q.z);
++      b.has_camera_chain = true;
 +    } else if (child.rfind("armor_", 0) == 0) {
 +      b.armor_positions[child] = Eigen::Vector3d(t.x, t.y, t.z);
 +    }
@@ -236,6 +311,9 @@ index a7f8efc..bb86362 100644
 +  std::lock_guard<std::mutex> lock(b.mutex);
 +  b.latest_image = std::move(decoded);
 +  b.latest_stamp = Clock::now();
++  ++b.latest_image_id;
++  b.latest_image_stamp = static_cast<double>(msg->header.stamp.sec) +
++                         static_cast<double>(msg->header.stamp.nanosec) * 1e-9;
 +  b.has_image = true;
 +}
 +
@@ -298,26 +376,59 @@ index a7f8efc..bb86362 100644
 +
 +  cv::Mat frame;
 +  TimePoint stamp;
++  uint64_t image_id = 0;
++  double image_stamp = 0.0;
 +  {
 +    std::lock_guard<std::mutex> lock(b.mutex);
 +    if (!b.has_image) return std::nullopt;
++    // 没有新帧就直接返回，避免同一帧被处理两次。
++    if (b.latest_image_id == b.consumed_image_id) return std::nullopt;
++    b.consumed_image_id = b.latest_image_id;
 +    frame = b.latest_image.clone();
 +    stamp = b.latest_stamp;
++    image_id = b.latest_image_id;
++    image_stamp = b.latest_image_stamp;
 +  }
 +
 +  SensorData data;
 +  data.image = std::move(frame);
 +  data.timestamp = stamp;
++  data.image_id = image_id;
++  data.image_stamp = image_stamp;
 +  {
 +    std::lock_guard<std::mutex> lock(b.mutex);
-+    if (b.has_gimbal) {
++    // 优先用与图像采集时刻最接近的 TF 样本（50 ms 内），否则退回最新值。
++    const double image_recv = std::chrono::duration<double>(stamp.time_since_epoch()).count();
++    const Bridge::PoseSample* best = nullptr;
++    double best_dt = 1e9;
++    for (const auto& sample : b.pose_samples) {
++      const double dt = std::abs(sample.recv - image_recv);
++      if (dt < best_dt) {
++        best_dt = dt;
++        best = &sample;
++      }
++    }
++    if (best != nullptr && best_dt <= 0.03) {
++      data.imu_q = best->rotation;
++      data.gimbal_origin = best->origin;
++      data.tf_stamp = best->stamp;
++      data.tf_sync_ms = (best->recv - image_recv) * 1000.0;
++      data.tf_interpolated = best_dt > 0.01;
++      if (best->has_camera) {
++        data.camera_to_world = best->camera_rotation;
++        data.camera_origin = best->camera_origin;
++        data.has_camera_pose = true;
++      }
++    } else if (b.has_gimbal) {
 +      const Eigen::Quaterniond base = b.has_odom ? b.odom_rotation.normalized()
 +                                                 : Eigen::Quaterniond::Identity();
 +      data.imu_q = (base * b.gimbal_local_rotation.normalized()).normalized();
 +      data.gimbal_origin = b.odom_position + base * b.gimbal_local_position;
++      data.tf_interpolated = true;
 +    } else {
 +      data.imu_q = Eigen::Quaterniond::Identity();
 +      data.gimbal_origin = b.odom_position;
++      data.tf_interpolated = true;
 +    }
 +  }
 +  data.bullet_speed = 25.0;  // 仿真弹速，第四讲预测与第五讲解算使用
@@ -716,10 +827,10 @@ index c9cbbd8..5a8a5ae 100644
  }
  }  // namespace training
 diff --git a/lessons/lesson04_tracking.cpp b/lessons/lesson04_tracking.cpp
-index d0a03a2..5d5f535 100644
+index d0a03a2..ff63e3f 100644
 --- a/lessons/lesson04_tracking.cpp
 +++ b/lessons/lesson04_tracking.cpp
-@@ -1,28 +1,234 @@
+@@ -1,28 +1,287 @@
  #include "lessons.hpp"
  
 +#include <opencv2/calib3d.hpp>
@@ -825,21 +936,50 @@ index d0a03a2..5d5f535 100644
 +                    Eigen::Vector3d& camera_xyz) {
 +  if (!calibration.valid()) return false;
 +  std::vector<cv::Point2f> image_points(armor.corners.begin(), armor.corners.end());
++  for (const auto& point : image_points) {
++    if (!std::isfinite(point.x) || !std::isfinite(point.y)) return false;
++  }
++  const auto object_points = armorObjectPoints(armor.large_armor);
++
++  // 平面四点存在“翻转”二义性：IPPE 会给出两个解，用重投影误差挑更小的那个，
++  // 避免 yaw 在正对时突然翻面。
++  std::vector<cv::Mat> rvecs, tvecs;
 +  cv::Vec3d rvec, tvec;
 +  try {
-+    // IPPE 专门用于平面四点，比迭代法稳定，且不需要初值。
-+    if (!cv::solvePnP(armorObjectPoints(armor.large_armor), image_points,
-+                      calibration.matrix, calibration.distortion, rvec, tvec, false,
-+                      cv::SOLVEPNP_IPPE)) {
-+      return false;
++    const int solutions = cv::solvePnPGeneric(
++        object_points, image_points, calibration.matrix, calibration.distortion,
++        rvecs, tvecs, false, cv::SOLVEPNP_IPPE);
++    if (solutions <= 0 || rvecs.empty()) return false;
++    double best_error = std::numeric_limits<double>::infinity();
++    for (std::size_t i = 0; i < rvecs.size(); ++i) {
++      std::vector<cv::Point2f> projected;
++      cv::projectPoints(object_points, rvecs[i], tvecs[i], calibration.matrix,
++                        calibration.distortion, projected);
++      double squared = 0.0;
++      for (std::size_t k = 0; k < projected.size(); ++k) {
++        const double dx = projected[k].x - image_points[k].x;
++        const double dy = projected[k].y - image_points[k].y;
++        squared += dx * dx + dy * dy;
++      }
++      const double error = std::sqrt(squared / projected.size());
++      if (error < best_error) {
++        best_error = error;
++        rvec = cv::Vec3d(rvecs[i]);
++        tvec = cv::Vec3d(tvecs[i]);
++      }
 +    }
 +  } catch (const cv::Exception&) {
 +    return false;
 +  }
-+  if (tvec[2] <= 0.0) return false;  // 板子在相机后面，丢弃
++
++  // 合法性检查：数值有限、深度在合理范围（0.2~30 m）。
++  if (!std::isfinite(tvec[0]) || !std::isfinite(tvec[1]) || !std::isfinite(tvec[2]) ||
++      !std::isfinite(rvec[0]) || !std::isfinite(rvec[1]) || !std::isfinite(rvec[2])) {
++    return false;
++  }
++  if (tvec[2] < 0.2 || tvec[2] > 30.0) return false;  // 太近/太远/在身后，丢弃
 +
 +  // IPPE 只保证平面四点的初值，再用 LM 最小化重投影误差，顺带拒绝离谱解。
-+  const auto object_points = armorObjectPoints(armor.large_armor);
 +  try {
 +    cv::solvePnPRefineLM(object_points, image_points, calibration.matrix,
 +                         calibration.distortion, rvec, tvec);
@@ -856,9 +996,13 @@ index d0a03a2..5d5f535 100644
 +    squared += dx * dx + dy * dy;
 +  }
 +  const double rmse = std::sqrt(squared / projected.size());
-+  if (rmse > 15.0) return false;      // 重投影误差过大，视为坏解
++  if (!std::isfinite(rmse) || rmse > 15.0) return false;  // 坏解
 +
 +  camera_xyz = Eigen::Vector3d(tvec[0], tvec[1], tvec[2]);
++  if (std::getenv("LESSON04_DIAG") != nullptr) {
++    std::fprintf(stderr, "[pnp] t=(%.3f,%.3f,%.3f) rmse=%.2f large=%d\n",
++                 tvec[0], tvec[1], tvec[2], rmse, static_cast<int>(armor.large_armor));
++  }
 +  return true;
 +}
 +
@@ -867,8 +1011,10 @@ index d0a03a2..5d5f535 100644
  std::optional<Target> lesson04_tracking(const std::vector<Armor>& armors,
 -    TimePoint timestamp, const Eigen::Quaterniond& imu_q, const CameraCalibration& calibration, TrackingState& state) {
 +    TimePoint timestamp, const Eigen::Quaterniond& imu_q,
-+    const Eigen::Vector3d& world_origin, const CameraCalibration& calibration,
++    const Eigen::Vector3d& world_origin, const Eigen::Quaterniond& camera_to_world,
++    const Eigen::Vector3d& camera_origin, const CameraCalibration& calibration,
 +    TrackingState& state) {
++  (void)imu_q;
    // ===== 实现区 BEGIN =====
 -  (void)armors; (void)timestamp; (void)imu_q; (void)calibration; (void)state;
 -  return std::nullopt;
@@ -883,20 +1029,38 @@ index d0a03a2..5d5f535 100644
 +  Eigen::Vector3d best_position = Eigen::Vector3d::Zero();
 +  double best_distance = 0.0;
 +
++  const double select_now =
++      std::chrono::duration<double>(timestamp.time_since_epoch()).count();
++  const double predict_dt = state.valid && state.last_time_sec > 0.0
++      ? std::clamp(select_now - state.last_time_sec, 0.0, 0.2) : 0.0;
++  const Eigen::Vector3d predicted_prev =
++      state.position + state.velocity * predict_dt;
++
++  double best_track_error = 0.0;
 +  for (const auto& armor : armors) {
 +    Eigen::Vector3d camera_xyz;
 +    if (!solveArmorPose(armor, calibration, camera_xyz)) continue;
 +
-+    // 相机系 → 云台系 → 世界系（IMU 稳定系）。
-+    const Eigen::Vector3d gimbal_xyz =
-+        calibration.camera_to_gimbal * camera_xyz + calibration.camera_to_gimbal_translation;
-+    const Eigen::Vector3d world_xyz = imu_q * gimbal_xyz + world_origin;
++    // 相机系 → 世界系：直接用 TF 链给出的相机位姿，不再依赖 25° 安装外参。
++    const Eigen::Vector3d world_xyz = camera_to_world * camera_xyz + camera_origin;
 +
-+    const double distance = world_xyz.norm();
-+    if (!found || distance < best_distance) {
-+      found = true;
-+      best_distance = distance;
-+      best_position = world_xyz;
++    if (state.valid) {
++      // 已经锁定过目标：选“离上一帧预测位置最近”的板，避免在多块板之间来回跳。
++      const double track_error = (world_xyz - predicted_prev).norm();
++      if (!found || track_error < best_track_error) {
++        found = true;
++        best_track_error = track_error;
++        best_distance = world_xyz.norm();
++        best_position = world_xyz;
++      }
++    } else {
++      // 首次锁定：选离相机最近的那块。
++      const double distance = world_xyz.norm();
++      if (!found || distance < best_distance) {
++        found = true;
++        best_distance = distance;
++        best_position = world_xyz;
++      }
 +    }
 +  }
 +
@@ -1056,15 +1220,16 @@ index bb2b357..ba7efc3 100644
  }
  }  // namespace training
 diff --git a/src/main.cpp b/src/main.cpp
-index 4a7bf8c..5f91a5b 100644
+index 4a7bf8c..4120cac 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
-@@ -1,13 +1,107 @@
+@@ -1,12 +1,123 @@
  #include "lessons.hpp"
  #include "io_context.hpp"
 +#include "vision_gt.hpp"
  #include <opencv2/highgui.hpp>
 +#include <opencv2/imgproc.hpp>
++#include <opencv2/calib3d.hpp>
 +#include <deque>
 +#include <optional>
  #include <csignal>
@@ -1096,6 +1261,22 @@ index 4a7bf8c..5f91a5b 100644
 +                     static_cast<float>(fy * camera.y() / camera.z() + cy));
 +}
 +
++std::optional<cv::Point2f> projectWorldCamera(const Eigen::Vector3d& world,
++                                              const Eigen::Quaterniond& camera_to_world,
++                                              const Eigen::Vector3d& camera_origin,
++                                              const training::CameraCalibration& calibration) {
++  if (!calibration.valid()) return std::nullopt;
++  const Eigen::Vector3d camera = camera_to_world.inverse() * (world - camera_origin);
++  if (camera.z() < 0.05) return std::nullopt;
++  std::vector<cv::Point3f> points{cv::Point3f(static_cast<float>(camera.x()),
++                                              static_cast<float>(camera.y()),
++                                              static_cast<float>(camera.z()))};
++  std::vector<cv::Point2f> image;
++  cv::projectPoints(points, cv::Vec3d(0, 0, 0), cv::Vec3d(0, 0, 0),
++                    calibration.matrix, calibration.distortion, image);
++  return image.front();
++}
++
 +void drawRune(cv::Mat& frame, const training::Rune& rune) {
 +  cv::Point polygon[4];
 +  for (int i = 0; i < 4; ++i) {
@@ -1108,8 +1289,8 @@ index 4a7bf8c..5f91a5b 100644
 +  std::snprintf(label, sizeof(label), "RUNE %.2f", rune.confidence);
 +  cv::putText(frame, label, cv::Point(polygon[0].x, std::max(14, polygon[0].y - 6)),
 +              cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 235, 255), 1, cv::LINE_AA);
- }
- 
++}
++
 +void drawArmors(cv::Mat& frame, const std::vector<training::Armor>& armors) {
 +  // 只影响显示：检测角点是灯条外沿（P nP 用的物理尺寸），画框时外扩到整块板。
 +  constexpr float kWiden = 1.35F;
@@ -1161,13 +1342,12 @@ index 4a7bf8c..5f91a5b 100644
 +                cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 255), 2,
 +                cv::LINE_AA);
 +  }
-+}
+ }
 +}  // namespace
-+
+ 
  int main(int argc, char** argv) {
    std::signal(SIGINT, on_signal);
-   std::signal(SIGTERM, on_signal);
-@@ -17,21 +111,152 @@ int main(int argc, char** argv) {
+@@ -17,21 +128,198 @@ int main(int argc, char** argv) {
    training::TrackingState tracking;
    devices.open();
  
@@ -1202,15 +1382,51 @@ index 4a7bf8c..5f91a5b 100644
 +        drawArmors(input->image, armors);
 +        for (const auto& rune : runes) drawRune(input->image, rune);
 +      }
++      const Eigen::Quaterniond camera_to_world =
++          input->has_camera_pose ? input->camera_to_world : input->imu_q;
++      const Eigen::Vector3d camera_origin =
++          input->has_camera_pose ? input->camera_origin : input->gimbal_origin;
++      static double dbg_yaw = 0.0, dbg_pitch = 0.0;
        const auto target = training::lesson04_tracking(
 -          armors, input->timestamp, input->imu_q, calibration, tracking);
 -      if (target)
-+          armors, input->timestamp, input->imu_q, input->gimbal_origin, calibration, tracking);
++          armors, input->timestamp, input->imu_q, input->gimbal_origin, camera_to_world,
++          camera_origin, calibration, tracking);
++      if (devices.config.show_diagnostics) {
++        static int diag = 0;
++        if (++diag % 30 == 0) {
++          const double process_ms =
++              std::chrono::duration<double>(training::Clock::now() - input->timestamp).count() * 1000.0;
++          const double tf_ms = input->tf_sync_ms;
++          std::fprintf(stderr,
++                       "[diag] frame=%llu dt1=%.2fms tf_dt=%.2fms interp=%d "
++                       "yawpitch=(%.1f,%.1f) pos=(%.3f,%.3f,%.3f) vel=(%.3f,%.3f,%.3f)\n",
++                       static_cast<unsigned long long>(input->image_id), process_ms, tf_ms,
++                       static_cast<int>(input->tf_interpolated),
++                       [&] {
++                         const Eigen::Matrix3d r = input->imu_q.toRotationMatrix();
++                         return std::atan2(r(1, 0), r(0, 0)) * 180.0 / training::kPi;
++                       }(),
++                       [&] {
++                         const Eigen::Matrix3d r = input->imu_q.toRotationMatrix();
++                         return std::asin(std::clamp(-r(2, 0), -1.0, 1.0)) * 180.0 / training::kPi;
++                       }(),
++                       target ? target->position.x() : 0.0,
++                       target ? target->position.y() : 0.0,
++                       target ? target->position.z() : 0.0,
++                       target ? target->velocity.x() : 0.0,
++                       target ? target->velocity.y() : 0.0,
++                       target ? target->velocity.z() : 0.0);
++
++        }
++      }
 +      // 丢目标时慢速旋转搜索：云台世界 yaw 从底盘姿态 × 云台局部姿态得到，
 +      // 所以底盘转过之后这里仍然是对的方向。找到目标就自动切回正常瞄准。
 +      static double search_yaw = 0.0;
 +      static bool has_search_yaw = false;
-+      if (target) {
++      if (devices.config.pose_only) {
++        command = training::Command{};  // 独立位姿测量：只观察，不发任何云台/开火指令
++      } else if (target) {
          command = training::lesson05_aiming(*target, input->timestamp, input->bullet_speed);
 +        if (command.control && devices.config.allow_fire && tracking.settle_frames == 0) {
 +          command.shoot = true;
@@ -1229,6 +1445,16 @@ index 4a7bf8c..5f91a5b 100644
 +        command.pitch = 25.0 * M_PI / 180.0;  // 相机水平，方便搜索
 +      }
 +
++      if (devices.config.show_diagnostics) {
++        static int cmd_diag = 0;
++        if (++cmd_diag % 30 == 0) {
++          std::fprintf(stderr, "[cmd] ctrl=%d yaw=%.1f pitch=%.1f shoot=%d\n",
++                       static_cast<int>(command.control), command.yaw * 180.0 / training::kPi,
++                       command.pitch * 180.0 / training::kPi,
++                       static_cast<int>(command.shoot));
++        }
++      }
++      dbg_yaw = command.yaw;
 +      // 第四讲可视化：PnP 位姿 vs 仿真真值；预测 250ms 后的位置并统计误差。
 +      static std::deque<std::pair<double, Eigen::Vector3d>> predictions;
 +      static double last_pred_error = 0.0;
@@ -1259,8 +1485,8 @@ index 4a7bf8c..5f91a5b 100644
 +        // 画 250ms 后的预测框（青色，调试开关控制）。predicted 是相对云台原点的
 +        // 向量，投回图像时先加回原点再走 projectWorld。
 +        if (devices.config.show_prediction && !armors.empty()) {
-+          if (const auto predicted_px = projectWorld(
-+                  predicted + input->gimbal_origin, input->imu_q, input->gimbal_origin, calibration)) {
++          if (const auto predicted_px = projectWorldCamera(
++                  predicted + input->gimbal_origin, camera_to_world, camera_origin, calibration)) {
 +            const cv::Rect2f box = cv::boundingRect(armors.front().corners);
 +            const double current_z = target->position.norm();
 +            const double predicted_z = predicted.norm();

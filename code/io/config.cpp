@@ -26,6 +26,8 @@ Config load_config(const std::string& path) {
   if (y["allow_fire"]) c.allow_fire = y["allow_fire"].as<bool>();
   if (y["enable_rune"]) c.enable_rune = y["enable_rune"].as<bool>();
   if (y["show_prediction"]) c.show_prediction = y["show_prediction"].as<bool>();
+  if (y["show_diagnostics"]) c.show_diagnostics = y["show_diagnostics"].as<bool>();
+  if (y["pose_only"]) c.pose_only = y["pose_only"].as<bool>();
   read_array(y, "camera_matrix", c.camera_matrix);
   read_array(y, "distort_coeffs", c.distort_coeffs);
   read_array(y, "R_camera2gimbal", c.camera_to_gimbal);

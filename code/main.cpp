@@ -3,6 +3,7 @@
 #include "vision_gt.hpp"
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/calib3d.hpp>
 #include <deque>
 #include <optional>
 #include <csignal>
@@ -32,6 +33,22 @@ std::optional<cv::Point2f> projectWorld(const Eigen::Vector3d& world,
   const double cy = calibration.matrix.at<double>(1, 2);
   return cv::Point2f(static_cast<float>(fx * camera.x() / camera.z() + cx),
                      static_cast<float>(fy * camera.y() / camera.z() + cy));
+}
+
+std::optional<cv::Point2f> projectWorldCamera(const Eigen::Vector3d& world,
+                                              const Eigen::Quaterniond& camera_to_world,
+                                              const Eigen::Vector3d& camera_origin,
+                                              const training::CameraCalibration& calibration) {
+  if (!calibration.valid()) return std::nullopt;
+  const Eigen::Vector3d camera = camera_to_world.inverse() * (world - camera_origin);
+  if (camera.z() < 0.05) return std::nullopt;
+  std::vector<cv::Point3f> points{cv::Point3f(static_cast<float>(camera.x()),
+                                              static_cast<float>(camera.y()),
+                                              static_cast<float>(camera.z()))};
+  std::vector<cv::Point2f> image;
+  cv::projectPoints(points, cv::Vec3d(0, 0, 0), cv::Vec3d(0, 0, 0),
+                    calibration.matrix, calibration.distortion, image);
+  return image.front();
 }
 
 void drawRune(cv::Mat& frame, const training::Rune& rune) {
@@ -141,13 +158,49 @@ int main(int argc, char** argv) {
         drawArmors(input->image, armors);
         for (const auto& rune : runes) drawRune(input->image, rune);
       }
+      const Eigen::Quaterniond camera_to_world =
+          input->has_camera_pose ? input->camera_to_world : input->imu_q;
+      const Eigen::Vector3d camera_origin =
+          input->has_camera_pose ? input->camera_origin : input->gimbal_origin;
+      static double dbg_yaw = 0.0, dbg_pitch = 0.0;
       const auto target = training::lesson04_tracking(
-          armors, input->timestamp, input->imu_q, input->gimbal_origin, calibration, tracking);
+          armors, input->timestamp, input->imu_q, input->gimbal_origin, camera_to_world,
+          camera_origin, calibration, tracking);
+      if (devices.config.show_diagnostics) {
+        static int diag = 0;
+        if (++diag % 30 == 0) {
+          const double process_ms =
+              std::chrono::duration<double>(training::Clock::now() - input->timestamp).count() * 1000.0;
+          const double tf_ms = input->tf_sync_ms;
+          std::fprintf(stderr,
+                       "[diag] frame=%llu dt1=%.2fms tf_dt=%.2fms interp=%d "
+                       "yawpitch=(%.1f,%.1f) pos=(%.3f,%.3f,%.3f) vel=(%.3f,%.3f,%.3f)\n",
+                       static_cast<unsigned long long>(input->image_id), process_ms, tf_ms,
+                       static_cast<int>(input->tf_interpolated),
+                       [&] {
+                         const Eigen::Matrix3d r = input->imu_q.toRotationMatrix();
+                         return std::atan2(r(1, 0), r(0, 0)) * 180.0 / training::kPi;
+                       }(),
+                       [&] {
+                         const Eigen::Matrix3d r = input->imu_q.toRotationMatrix();
+                         return std::asin(std::clamp(-r(2, 0), -1.0, 1.0)) * 180.0 / training::kPi;
+                       }(),
+                       target ? target->position.x() : 0.0,
+                       target ? target->position.y() : 0.0,
+                       target ? target->position.z() : 0.0,
+                       target ? target->velocity.x() : 0.0,
+                       target ? target->velocity.y() : 0.0,
+                       target ? target->velocity.z() : 0.0);
+
+        }
+      }
       // 丢目标时慢速旋转搜索：云台世界 yaw 从底盘姿态 × 云台局部姿态得到，
       // 所以底盘转过之后这里仍然是对的方向。找到目标就自动切回正常瞄准。
       static double search_yaw = 0.0;
       static bool has_search_yaw = false;
-      if (target) {
+      if (devices.config.pose_only) {
+        command = training::Command{};  // 独立位姿测量：只观察，不发任何云台/开火指令
+      } else if (target) {
         command = training::lesson05_aiming(*target, input->timestamp, input->bullet_speed);
         if (command.control && devices.config.allow_fire && tracking.settle_frames == 0) {
           command.shoot = true;
@@ -166,6 +219,16 @@ int main(int argc, char** argv) {
         command.pitch = 25.0 * M_PI / 180.0;  // 相机水平，方便搜索
       }
 
+      if (devices.config.show_diagnostics) {
+        static int cmd_diag = 0;
+        if (++cmd_diag % 30 == 0) {
+          std::fprintf(stderr, "[cmd] ctrl=%d yaw=%.1f pitch=%.1f shoot=%d\n",
+                       static_cast<int>(command.control), command.yaw * 180.0 / training::kPi,
+                       command.pitch * 180.0 / training::kPi,
+                       static_cast<int>(command.shoot));
+        }
+      }
+      dbg_yaw = command.yaw;
       // 第四讲可视化：PnP 位姿 vs 仿真真值；预测 250ms 后的位置并统计误差。
       static std::deque<std::pair<double, Eigen::Vector3d>> predictions;
       static double last_pred_error = 0.0;
@@ -196,8 +259,8 @@ int main(int argc, char** argv) {
         // 画 250ms 后的预测框（青色，调试开关控制）。predicted 是相对云台原点的
         // 向量，投回图像时先加回原点再走 projectWorld。
         if (devices.config.show_prediction && !armors.empty()) {
-          if (const auto predicted_px = projectWorld(
-                  predicted + input->gimbal_origin, input->imu_q, input->gimbal_origin, calibration)) {
+          if (const auto predicted_px = projectWorldCamera(
+                  predicted + input->gimbal_origin, camera_to_world, camera_origin, calibration)) {
             const cv::Rect2f box = cv::boundingRect(armors.front().corners);
             const double current_z = target->position.norm();
             const double predicted_z = predicted.norm();
