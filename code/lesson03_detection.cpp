@@ -255,7 +255,12 @@ std::vector<Armor> lesson03_detection(const cv::Mat& image) {
           center_distance < 0.55F * std::max(box.width, other_box.width) &&
           width_ratio > 0.6F && width_ratio < 1.7F &&
           height_ratio > 0.6F && height_ratio < 1.7F;
-      if (iou(armor.corners, other.corners) > kSuppressIou || near_duplicate) {
+      // 包住真板的大框（整车侧面被当成一块板）也要抑制：真板几乎完全落在它里面。
+      const cv::Rect2f inter = box & other_box;
+      const float inter_area = std::max(0.0F, inter.width) * std::max(0.0F, inter.height);
+      const float min_area = std::min(box.area(), other_box.area());
+      const bool contained = min_area > 1.0F && inter_area / min_area > 0.6F;
+      if (iou(armor.corners, other.corners) > kSuppressIou || near_duplicate || contained) {
         duplicate = true;
         break;
       }
