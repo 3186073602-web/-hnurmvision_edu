@@ -29,6 +29,7 @@ Config load_config(const std::string& path) {
   if (y["show_diagnostics"]) c.show_diagnostics = y["show_diagnostics"].as<bool>();
   if (y["pose_only"]) c.pose_only = y["pose_only"].as<bool>();
   if (y["min_armor_confidence"]) c.min_armor_confidence = y["min_armor_confidence"].as<double>();
+  if (y["keep_best_armor"]) c.keep_best_armor = y["keep_best_armor"].as<bool>();
   read_array(y, "camera_matrix", c.camera_matrix);
   read_array(y, "distort_coeffs", c.distort_coeffs);
   read_array(y, "R_camera2gimbal", c.camera_to_gimbal);

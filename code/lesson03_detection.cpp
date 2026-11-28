@@ -40,6 +40,7 @@ constexpr float kMinArmorAspect = 1.60F;  // 装甲板外接框 宽/高
 constexpr float kMaxArmorAspect = 5.00F;
 constexpr float kLargeArmorAspect = 2.85F; // 超过即视为大装甲板（哨兵）
 float g_minConfidence = 0.62F;  // 可由 config 调整（0~1）
+bool g_keepBestArmor = false;   // 场上多于一个框时只保留置信度最高的那个
 constexpr float kSuppressIou = 0.45F;
 
 struct LightBar {
@@ -158,6 +159,8 @@ float iou(const std::array<cv::Point2f, 4>& a, const std::array<cv::Point2f, 4>&
 void setMinArmorConfidence(float value) {
   g_minConfidence = std::clamp(value, 0.0F, 0.99F);
 }
+
+void setKeepBestArmor(bool value) { g_keepBestArmor = value; }
 
 std::vector<Armor> lesson03_detection(const cv::Mat& image) {
   if (std::getenv("LESSON03_DUMP") != nullptr) {
@@ -340,6 +343,15 @@ std::vector<Armor> lesson03_detection(const cv::Mat& image) {
       }
     }
     if (!duplicate) kept.push_back(armor);
+  }
+  // 场上出现两个以上框时，只保留置信度（画面里的 SMALL 0.xx）最高的一个。
+  if (g_keepBestArmor && kept.size() > 1) {
+    const auto best = std::max_element(
+        kept.begin(), kept.end(),
+        [](const Armor& a, const Armor& b) { return a.confidence < b.confidence; });
+    const Armor best_armor = *best;
+    kept.clear();
+    kept.push_back(best_armor);
   }
   if (std::getenv("LESSON03_DEBUG") != nullptr) {
     std::fprintf(stderr, "[det-final] n=%zu", kept.size());

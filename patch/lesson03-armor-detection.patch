@@ -1,5 +1,5 @@
 diff --git a/configs/simulation.yaml b/configs/simulation.yaml
-index ae82170..344b6c7 100644
+index ae82170..de760a3 100644
 --- a/configs/simulation.yaml
 +++ b/configs/simulation.yaml
 @@ -1,6 +1,13 @@
@@ -17,7 +17,7 @@ index ae82170..344b6c7 100644
  
  # 仿真环境下的相机内参
  camera_matrix: [1303.6753236814714, 0.0, 720.0,
-@@ -10,7 +17,12 @@ distort_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
+@@ -10,7 +17,14 @@ distort_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
  
  # 相机光学坐标系到云台坐标系：p_gimbal = R * p_camera + t。
  # vehicle.glb 中相机/枪口固定仰角为 25°。
@@ -33,15 +33,18 @@ index ae82170..344b6c7 100644
 +pose_only: false
 +# 装甲板最低置信度（画面里的 SMALL 0.xx）：低于它的框直接丢弃。
 +min_armor_confidence: 0.62
++# 场上有多个框时只保留 SMALL 数值最大的那个。
++keep_best_armor: true
 diff --git a/include/lessons.hpp b/include/lessons.hpp
-index 86fa46e..dbd80e9 100644
+index 86fa46e..4764e98 100644
 --- a/include/lessons.hpp
 +++ b/include/lessons.hpp
-@@ -6,7 +6,18 @@
+@@ -6,7 +6,19 @@
  
  namespace training {
  std::vector<Armor> lesson03_detection(const cv::Mat& image);
 +void setMinArmorConfidence(float value);
++void setKeepBestArmor(bool value);
 +
 +// 能量机关（能量装置）观测：每个圆形小装置一个紧贴的小框 + 置信度。
 +struct Rune {
@@ -121,10 +124,10 @@ index 53d64e7..75d139e 100644
  
  // 第五讲输出：绝对角使用 rad，IO 边界统一转换单位和方向。
 diff --git a/io/config.cpp b/io/config.cpp
-index 7746963..de6fce5 100644
+index 7746963..4b66b68 100644
 --- a/io/config.cpp
 +++ b/io/config.cpp
-@@ -24,6 +24,11 @@ Config load_config(const std::string& path) {
+@@ -24,6 +24,12 @@ Config load_config(const std::string& path) {
    Config c;
    if (y["display"]) c.display = y["display"].as<bool>();
    if (y["allow_fire"]) c.allow_fire = y["allow_fire"].as<bool>();
@@ -133,14 +136,15 @@ index 7746963..de6fce5 100644
 +  if (y["show_diagnostics"]) c.show_diagnostics = y["show_diagnostics"].as<bool>();
 +  if (y["pose_only"]) c.pose_only = y["pose_only"].as<bool>();
 +  if (y["min_armor_confidence"]) c.min_armor_confidence = y["min_armor_confidence"].as<double>();
++  if (y["keep_best_armor"]) c.keep_best_armor = y["keep_best_armor"].as<bool>();
    read_array(y, "camera_matrix", c.camera_matrix);
    read_array(y, "distort_coeffs", c.distort_coeffs);
    read_array(y, "R_camera2gimbal", c.camera_to_gimbal);
 diff --git a/io/config.hpp b/io/config.hpp
-index 04b8637..2f59d99 100644
+index 04b8637..cf5c487 100644
 --- a/io/config.hpp
 +++ b/io/config.hpp
-@@ -6,6 +6,16 @@ namespace training {
+@@ -6,6 +6,18 @@ namespace training {
  struct Config {
    bool display = true;
    bool allow_fire = false;
@@ -154,6 +158,8 @@ index 04b8637..2f59d99 100644
 +  bool pose_only = false;
 +  // 装甲板检测的最低置信度（可视化里的 SMALL 0.xx 那个数）。
 +  double min_armor_confidence = 0.62;
++  // 场上出现多个候选框时，只保留置信度最高的一个（对应画面里的 SMALL 数值）。
++  bool keep_best_armor = true;
    std::array<double, 9> camera_matrix{
        1303.6753236814714, 0, 720, 0, 1303.6753236814714, 540, 0, 0, 1};
    std::array<double, 5> distort_coeffs{0, 0, 0, 0, 0};
@@ -481,10 +487,10 @@ index a7f8efc..a2a7e3f 100644
  }
  }  // namespace training::io
 diff --git a/lessons/lesson03_detection.cpp b/lessons/lesson03_detection.cpp
-index c9cbbd8..533dac7 100644
+index c9cbbd8..b7587d5 100644
 --- a/lessons/lesson03_detection.cpp
 +++ b/lessons/lesson03_detection.cpp
-@@ -1,13 +1,441 @@
+@@ -1,13 +1,453 @@
  #include "lessons.hpp"
  
 +#include <opencv2/imgproc.hpp>
@@ -531,6 +537,7 @@ index c9cbbd8..533dac7 100644
 +constexpr float kMaxArmorAspect = 5.00F;
 +constexpr float kLargeArmorAspect = 2.85F; // 超过即视为大装甲板（哨兵）
 +float g_minConfidence = 0.62F;  // 可由 config 调整（0~1）
++bool g_keepBestArmor = false;   // 场上多于一个框时只保留置信度最高的那个
 +constexpr float kSuppressIou = 0.45F;
 +
 +struct LightBar {
@@ -649,6 +656,8 @@ index c9cbbd8..533dac7 100644
 +void setMinArmorConfidence(float value) {
 +  g_minConfidence = std::clamp(value, 0.0F, 0.99F);
 +}
++
++void setKeepBestArmor(bool value) { g_keepBestArmor = value; }
 +
  std::vector<Armor> lesson03_detection(const cv::Mat& image) {
 -  // TODO(第三讲)：实现装甲板检测，填写角点、大小板、编号与置信度。
@@ -834,6 +843,15 @@ index c9cbbd8..533dac7 100644
 +      }
 +    }
 +    if (!duplicate) kept.push_back(armor);
++  }
++  // 场上出现两个以上框时，只保留置信度（画面里的 SMALL 0.xx）最高的一个。
++  if (g_keepBestArmor && kept.size() > 1) {
++    const auto best = std::max_element(
++        kept.begin(), kept.end(),
++        [](const Armor& a, const Armor& b) { return a.confidence < b.confidence; });
++    const Armor best_armor = *best;
++    kept.clear();
++    kept.push_back(best_armor);
 +  }
 +  if (std::getenv("LESSON03_DEBUG") != nullptr) {
 +    std::fprintf(stderr, "[det-final] n=%zu", kept.size());
@@ -1327,10 +1345,10 @@ index bb2b357..ba7efc3 100644
  }
  }  // namespace training
 diff --git a/src/main.cpp b/src/main.cpp
-index 4a7bf8c..20b538c 100644
+index 4a7bf8c..ae356e9 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
-@@ -1,37 +1,326 @@
+@@ -1,37 +1,327 @@
  #include "lessons.hpp"
  #include "io_context.hpp"
 +#include "vision_gt.hpp"
@@ -1457,6 +1475,7 @@ index 4a7bf8c..20b538c 100644
    std::signal(SIGTERM, on_signal);
    const auto config = training::load_config(argc > 1 ? argv[1] : "configs/simulation.yaml");
 +  training::setMinArmorConfidence(static_cast<float>(config.min_armor_confidence));
++  training::setKeepBestArmor(config.keep_best_armor);
    const auto calibration = training::load_calibration(config);
    training::io::IoContext devices{config};
    training::TrackingState tracking;

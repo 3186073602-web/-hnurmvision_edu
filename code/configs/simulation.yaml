@@ -26,3 +26,5 @@ t_camera2gimbal: [0.060, 0.002, 0.158]
 pose_only: false
 # 装甲板最低置信度（画面里的 SMALL 0.xx）：低于它的框直接丢弃。
 min_armor_confidence: 0.62
+# 场上有多个框时只保留 SMALL 数值最大的那个。
+keep_best_armor: true

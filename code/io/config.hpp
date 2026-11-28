@@ -16,6 +16,8 @@ struct Config {
   bool pose_only = false;
   // 装甲板检测的最低置信度（可视化里的 SMALL 0.xx 那个数）。
   double min_armor_confidence = 0.62;
+  // 场上出现多个候选框时，只保留置信度最高的一个（对应画面里的 SMALL 数值）。
+  bool keep_best_armor = true;
   std::array<double, 9> camera_matrix{
       1303.6753236814714, 0, 720, 0, 1303.6753236814714, 540, 0, 0, 1};
   std::array<double, 5> distort_coeffs{0, 0, 0, 0, 0};
