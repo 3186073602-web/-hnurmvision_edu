@@ -30,6 +30,11 @@ Config load_config(const std::string& path) {
   if (y["pose_only"]) c.pose_only = y["pose_only"].as<bool>();
   if (y["min_armor_confidence"]) c.min_armor_confidence = y["min_armor_confidence"].as<double>();
   if (y["keep_best_armor"]) c.keep_best_armor = y["keep_best_armor"].as<bool>();
+  if (y["aim_servo"]) c.aim_servo = y["aim_servo"].as<bool>();
+  if (y["servo_gain"]) c.servo_gain = y["servo_gain"].as<double>();
+  if (y["servo_pitch_bias_deg"]) c.servo_pitch_bias_deg = y["servo_pitch_bias_deg"].as<double>();
+  if (y["search_on_loss"]) c.search_on_loss = y["search_on_loss"].as<bool>();
+  if (y["aim_pitch_trim_deg"]) c.aim_pitch_trim_deg = y["aim_pitch_trim_deg"].as<double>();
   read_array(y, "camera_matrix", c.camera_matrix);
   read_array(y, "distort_coeffs", c.distort_coeffs);
   read_array(y, "R_camera2gimbal", c.camera_to_gimbal);

@@ -28,3 +28,11 @@ pose_only: false
 min_armor_confidence: 0.62
 # 场上有多个框时只保留 SMALL 数值最大的那个。
 keep_best_armor: true
+# 瞄准：增量式图像伺服（云台不会“追自己”）。
+aim_servo: true
+servo_gain: 0.05
+servo_pitch_bias_deg: 2.6
+# 丢目标时是否搜索（默认关闭）
+search_on_loss: false
+# 绝对角瞄准的 pitch 微调（度），用于补偿安装角/标定误差。
+aim_pitch_trim_deg: 0.0

@@ -18,6 +18,15 @@ struct Config {
   double min_armor_confidence = 0.62;
   // 场上出现多个候选框时，只保留置信度最高的一个（对应画面里的 SMALL 数值）。
   bool keep_best_armor = true;
+  // 瞄准方式：true = 增量式图像伺服（推荐），false = 世界系绝对角。
+  bool aim_servo = true;
+  double servo_gain = 0.10;
+  // 相机光轴比枪口低的角度（真板在画面里应低于中心这么多才打中）。
+  double servo_pitch_bias_deg = 2.6;
+  // 丢目标时是否慢速旋转搜索（考核中默认关闭，避免云台乱转）。
+  bool search_on_loss = false;
+  // 绝对角瞄准时的 pitch 微调（度）：补偿相机/枪口安装角与标定误差。
+  double aim_pitch_trim_deg = 0.0;
   std::array<double, 9> camera_matrix{
       1303.6753236814714, 0, 720, 0, 1303.6753236814714, 540, 0, 0, 1};
   std::array<double, 5> distort_coeffs{0, 0, 0, 0, 0};

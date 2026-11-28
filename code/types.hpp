@@ -25,17 +25,6 @@ struct SensorData {
   Eigen::Quaterniond imu_q = Eigen::Quaterniond::Identity();
   Eigen::Vector3d gimbal_origin = Eigen::Vector3d::Zero();
   double bullet_speed = 0;  // m/s
-
-  // —— 数据同步诊断（不参与算法，只用于排查时间/重复帧问题）——
-  uint64_t image_id = 0;       // 每帧唯一，用来发现重复处理
-  double image_stamp = 0.0;    // 图像在 ROS 时钟下的采集时间，s
-  double tf_stamp = 0.0;       // 所用 TF 样本的 ROS 时间戳，s
-  double tf_sync_ms = 0.0;     // TF 与图像在“接收时刻”上的差，ms（同一 steady 时钟）
-  bool tf_interpolated = false;// 是否用了“最近邻”而不是严格同刻 TF
-  // 相机光学系在世界系中的位姿（由 TF 链直接给出，不依赖相机→云台外参）。
-  Eigen::Quaterniond camera_to_world = Eigen::Quaterniond::Identity();
-  Eigen::Vector3d camera_origin = Eigen::Vector3d::Zero();
-  bool has_camera_pose = false;
 };
 
 // 第三讲输出：一块装甲板的图像观测。

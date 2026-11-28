@@ -29,8 +29,6 @@ constexpr double kProcessNoise = 4.0;
 constexpr double kMeasurementNoise = 1.5e-2 * 1.5e-2;
 constexpr double kMaxSpeed = 4.0;
 constexpr double kMaxAccel = 8.0;
-// 换板门限：旋转靶四块板相距约 0.4 m，观测跳变超过它就当作换板。
-constexpr double kSwitchGate = 0.35;
 
 // 单轴常加速度卡尔曼一步预测 + 更新。
 void kalmanStep(double measurement, double dt, double& position, double& velocity,
@@ -86,50 +84,21 @@ bool solveArmorPose(const Armor& armor, const CameraCalibration& calibration,
                     Eigen::Vector3d& camera_xyz) {
   if (!calibration.valid()) return false;
   std::vector<cv::Point2f> image_points(armor.corners.begin(), armor.corners.end());
-  for (const auto& point : image_points) {
-    if (!std::isfinite(point.x) || !std::isfinite(point.y)) return false;
-  }
-  const auto object_points = armorObjectPoints(armor.large_armor);
-
-  // 平面四点存在“翻转”二义性：IPPE 会给出两个解，用重投影误差挑更小的那个，
-  // 避免 yaw 在正对时突然翻面。
-  std::vector<cv::Mat> rvecs, tvecs;
   cv::Vec3d rvec, tvec;
   try {
-    const int solutions = cv::solvePnPGeneric(
-        object_points, image_points, calibration.matrix, calibration.distortion,
-        rvecs, tvecs, false, cv::SOLVEPNP_IPPE);
-    if (solutions <= 0 || rvecs.empty()) return false;
-    double best_error = std::numeric_limits<double>::infinity();
-    for (std::size_t i = 0; i < rvecs.size(); ++i) {
-      std::vector<cv::Point2f> projected;
-      cv::projectPoints(object_points, rvecs[i], tvecs[i], calibration.matrix,
-                        calibration.distortion, projected);
-      double squared = 0.0;
-      for (std::size_t k = 0; k < projected.size(); ++k) {
-        const double dx = projected[k].x - image_points[k].x;
-        const double dy = projected[k].y - image_points[k].y;
-        squared += dx * dx + dy * dy;
-      }
-      const double error = std::sqrt(squared / projected.size());
-      if (error < best_error) {
-        best_error = error;
-        rvec = cv::Vec3d(rvecs[i]);
-        tvec = cv::Vec3d(tvecs[i]);
-      }
+    // IPPE 专门用于平面四点，比迭代法稳定，且不需要初值。
+    if (!cv::solvePnP(armorObjectPoints(armor.large_armor), image_points,
+                      calibration.matrix, calibration.distortion, rvec, tvec, false,
+                      cv::SOLVEPNP_IPPE)) {
+      return false;
     }
   } catch (const cv::Exception&) {
     return false;
   }
-
-  // 合法性检查：数值有限、深度在合理范围（0.2~30 m）。
-  if (!std::isfinite(tvec[0]) || !std::isfinite(tvec[1]) || !std::isfinite(tvec[2]) ||
-      !std::isfinite(rvec[0]) || !std::isfinite(rvec[1]) || !std::isfinite(rvec[2])) {
-    return false;
-  }
-  if (tvec[2] < 0.2 || tvec[2] > 30.0) return false;  // 太近/太远/在身后，丢弃
+  if (tvec[2] <= 0.0) return false;  // 板子在相机后面，丢弃
 
   // IPPE 只保证平面四点的初值，再用 LM 最小化重投影误差，顺带拒绝离谱解。
+  const auto object_points = armorObjectPoints(armor.large_armor);
   try {
     cv::solvePnPRefineLM(object_points, image_points, calibration.matrix,
                          calibration.distortion, rvec, tvec);
@@ -146,13 +115,9 @@ bool solveArmorPose(const Armor& armor, const CameraCalibration& calibration,
     squared += dx * dx + dy * dy;
   }
   const double rmse = std::sqrt(squared / projected.size());
-  if (!std::isfinite(rmse) || rmse > 15.0) return false;  // 坏解
+  if (rmse > 15.0) return false;      // 重投影误差过大，视为坏解
 
   camera_xyz = Eigen::Vector3d(tvec[0], tvec[1], tvec[2]);
-  if (std::getenv("LESSON04_DIAG") != nullptr) {
-    std::fprintf(stderr, "[pnp] t=(%.3f,%.3f,%.3f) rmse=%.2f large=%d\n",
-                 tvec[0], tvec[1], tvec[2], rmse, static_cast<int>(armor.large_armor));
-  }
   return true;
 }
 
@@ -160,10 +125,8 @@ bool solveArmorPose(const Armor& armor, const CameraCalibration& calibration,
 
 std::optional<Target> lesson04_tracking(const std::vector<Armor>& armors,
     TimePoint timestamp, const Eigen::Quaterniond& imu_q,
-    const Eigen::Vector3d& world_origin, const Eigen::Quaterniond& camera_to_world,
-    const Eigen::Vector3d& camera_origin, const CameraCalibration& calibration,
+    const Eigen::Vector3d& world_origin, const CameraCalibration& calibration,
     TrackingState& state) {
-  (void)imu_q;
   // ===== 实现区 BEGIN =====
   if (armors.empty()) {
     state.valid = false;
@@ -176,38 +139,20 @@ std::optional<Target> lesson04_tracking(const std::vector<Armor>& armors,
   Eigen::Vector3d best_position = Eigen::Vector3d::Zero();
   double best_distance = 0.0;
 
-  const double select_now =
-      std::chrono::duration<double>(timestamp.time_since_epoch()).count();
-  const double predict_dt = state.valid && state.last_time_sec > 0.0
-      ? std::clamp(select_now - state.last_time_sec, 0.0, 0.2) : 0.0;
-  const Eigen::Vector3d predicted_prev =
-      state.position + state.velocity * predict_dt;
-
-  double best_track_error = 0.0;
   for (const auto& armor : armors) {
     Eigen::Vector3d camera_xyz;
     if (!solveArmorPose(armor, calibration, camera_xyz)) continue;
 
-    // 相机系 → 世界系：直接用 TF 链给出的相机位姿，不再依赖 25° 安装外参。
-    const Eigen::Vector3d world_xyz = camera_to_world * camera_xyz + camera_origin;
+    // 相机系 → 云台系 → 世界系（IMU 稳定系）。
+    const Eigen::Vector3d gimbal_xyz =
+        calibration.camera_to_gimbal * camera_xyz + calibration.camera_to_gimbal_translation;
+    const Eigen::Vector3d world_xyz = imu_q * gimbal_xyz + world_origin;
 
-    if (state.valid) {
-      // 已经锁定过目标：选“离上一帧预测位置最近”的板，避免在多块板之间来回跳。
-      const double track_error = (world_xyz - predicted_prev).norm();
-      if (!found || track_error < best_track_error) {
-        found = true;
-        best_track_error = track_error;
-        best_distance = world_xyz.norm();
-        best_position = world_xyz;
-      }
-    } else {
-      // 首次锁定：选离相机最近的那块。
-      const double distance = world_xyz.norm();
-      if (!found || distance < best_distance) {
-        found = true;
-        best_distance = distance;
-        best_position = world_xyz;
-      }
+    const double distance = world_xyz.norm();
+    if (!found || distance < best_distance) {
+      found = true;
+      best_distance = distance;
+      best_position = world_xyz;
     }
   }
 
@@ -224,19 +169,7 @@ std::optional<Target> lesson04_tracking(const std::vector<Armor>& armors,
       std::chrono::duration<double>(timestamp.time_since_epoch()).count();
   if (state.valid && state.last_time_sec > 0.0) {
     const double dt_pair = now_sec - state.last_time_sec;
-    const Eigen::Vector3d innovation =
-        best_position - (state.position + state.velocity * dt_pair);
-    if (innovation.norm() > kSwitchGate) {
-      // 换板：位置立刻跟随新板，速度/加速度清零重新估计，并进入 6 帧稳定期。
-      position = best_position;
-      for (auto& covariance : state.covariance) {
-        covariance = Eigen::Matrix3d::Zero();
-        covariance(0, 0) = 1.0;
-        covariance(1, 1) = 10.0;
-        covariance(2, 2) = 10.0;
-      }
-      state.settle_frames = 6;
-    } else if (dt_pair > 1e-3 && dt_pair < kMaxTrackGap) {
+    if (dt_pair > 1e-3 && dt_pair < kMaxTrackGap) {
       position = state.position;
       velocity = state.velocity;
       acceleration = state.acceleration;
@@ -267,7 +200,6 @@ std::optional<Target> lesson04_tracking(const std::vector<Armor>& armors,
     }
   }
 
-  if (state.settle_frames > 0) --state.settle_frames;
   state.valid = true;
   state.position = position;
   state.velocity = velocity;
