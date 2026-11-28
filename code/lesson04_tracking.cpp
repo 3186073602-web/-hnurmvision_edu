@@ -29,6 +29,8 @@ constexpr double kProcessNoise = 4.0;
 constexpr double kMeasurementNoise = 1.5e-2 * 1.5e-2;
 constexpr double kMaxSpeed = 4.0;
 constexpr double kMaxAccel = 8.0;
+// 换板门限：旋转靶四块板相距约 0.4 m，观测跳变超过它就当作换板。
+constexpr double kSwitchGate = 0.35;
 
 // 单轴常加速度卡尔曼一步预测 + 更新。
 void kalmanStep(double measurement, double dt, double& position, double& velocity,
@@ -169,7 +171,19 @@ std::optional<Target> lesson04_tracking(const std::vector<Armor>& armors,
       std::chrono::duration<double>(timestamp.time_since_epoch()).count();
   if (state.valid && state.last_time_sec > 0.0) {
     const double dt_pair = now_sec - state.last_time_sec;
-    if (dt_pair > 1e-3 && dt_pair < kMaxTrackGap) {
+    const Eigen::Vector3d innovation =
+        best_position - (state.position + state.velocity * dt_pair);
+    if (innovation.norm() > kSwitchGate) {
+      // 换板：位置立刻跟随新板，速度/加速度清零重新估计，并进入 6 帧稳定期。
+      position = best_position;
+      for (auto& covariance : state.covariance) {
+        covariance = Eigen::Matrix3d::Zero();
+        covariance(0, 0) = 1.0;
+        covariance(1, 1) = 10.0;
+        covariance(2, 2) = 10.0;
+      }
+      state.settle_frames = 6;
+    } else if (dt_pair > 1e-3 && dt_pair < kMaxTrackGap) {
       position = state.position;
       velocity = state.velocity;
       acceleration = state.acceleration;
@@ -200,6 +214,7 @@ std::optional<Target> lesson04_tracking(const std::vector<Armor>& armors,
     }
   }
 
+  if (state.settle_frames > 0) --state.settle_frames;
   state.valid = true;
   state.position = position;
   state.velocity = velocity;

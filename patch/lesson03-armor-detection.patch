@@ -49,10 +49,10 @@ index 86fa46e..480661b 100644
  Command lesson05_aiming(const Target& target, TimePoint timestamp, double bullet_speed);
  }  // namespace training
 diff --git a/include/tracking_state.hpp b/include/tracking_state.hpp
-index 3f3cc22..d91476b 100644
+index 3f3cc22..7bcec96 100644
 --- a/include/tracking_state.hpp
 +++ b/include/tracking_state.hpp
-@@ -1,8 +1,21 @@
+@@ -1,8 +1,23 @@
  #pragma once
 +#include <Eigen/Geometry>
 +#include <optional>
@@ -73,6 +73,8 @@ index 3f3cc22..d91476b 100644
 +      Eigen::Matrix3d::Identity(), Eigen::Matrix3d::Identity(), Eigen::Matrix3d::Identity()};
 +  double last_time_sec = 0.0;
 +  double last_distance = 0.0;  // m，PnP 距离，用于选板
++  // 换板后的稳定期：这段时间内重新估计速度，先别开火（避免拿旧速度打空）。
++  int settle_frames = 0;
  };
  }  // namespace training
 diff --git a/include/types.hpp b/include/types.hpp
@@ -684,10 +686,10 @@ index c9cbbd8..91958c8 100644
  }
  }  // namespace training
 diff --git a/lessons/lesson04_tracking.cpp b/lessons/lesson04_tracking.cpp
-index d0a03a2..8a55a79 100644
+index d0a03a2..5d5f535 100644
 --- a/lessons/lesson04_tracking.cpp
 +++ b/lessons/lesson04_tracking.cpp
-@@ -1,28 +1,219 @@
+@@ -1,28 +1,234 @@
  #include "lessons.hpp"
  
 +#include <opencv2/calib3d.hpp>
@@ -736,6 +738,8 @@ index d0a03a2..8a55a79 100644
 +constexpr double kMeasurementNoise = 1.5e-2 * 1.5e-2;
 +constexpr double kMaxSpeed = 4.0;
 +constexpr double kMaxAccel = 8.0;
++// 换板门限：旋转靶四块板相距约 0.4 m，观测跳变超过它就当作换板。
++constexpr double kSwitchGate = 0.35;
 +
 +// 单轴常加速度卡尔曼一步预测 + 更新。
 +void kalmanStep(double measurement, double dt, double& position, double& velocity,
@@ -879,7 +883,19 @@ index d0a03a2..8a55a79 100644
 +      std::chrono::duration<double>(timestamp.time_since_epoch()).count();
 +  if (state.valid && state.last_time_sec > 0.0) {
 +    const double dt_pair = now_sec - state.last_time_sec;
-+    if (dt_pair > 1e-3 && dt_pair < kMaxTrackGap) {
++    const Eigen::Vector3d innovation =
++        best_position - (state.position + state.velocity * dt_pair);
++    if (innovation.norm() > kSwitchGate) {
++      // 换板：位置立刻跟随新板，速度/加速度清零重新估计，并进入 6 帧稳定期。
++      position = best_position;
++      for (auto& covariance : state.covariance) {
++        covariance = Eigen::Matrix3d::Zero();
++        covariance(0, 0) = 1.0;
++        covariance(1, 1) = 10.0;
++        covariance(2, 2) = 10.0;
++      }
++      state.settle_frames = 6;
++    } else if (dt_pair > 1e-3 && dt_pair < kMaxTrackGap) {
 +      position = state.position;
 +      velocity = state.velocity;
 +      acceleration = state.acceleration;
@@ -910,6 +926,7 @@ index d0a03a2..8a55a79 100644
 +    }
 +  }
 +
++  if (state.settle_frames > 0) --state.settle_frames;
 +  state.valid = true;
 +  state.position = position;
 +  state.velocity = velocity;
@@ -1009,7 +1026,7 @@ index bb2b357..ba7efc3 100644
  }
  }  // namespace training
 diff --git a/src/main.cpp b/src/main.cpp
-index 4a7bf8c..133a6fb 100644
+index 4a7bf8c..6129c78 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
 @@ -1,12 +1,106 @@
@@ -1119,7 +1136,7 @@ index 4a7bf8c..133a6fb 100644
  
  int main(int argc, char** argv) {
    std::signal(SIGINT, on_signal);
-@@ -17,21 +111,132 @@ int main(int argc, char** argv) {
+@@ -17,21 +111,134 @@ int main(int argc, char** argv) {
    training::TrackingState tracking;
    devices.open();
  
@@ -1161,7 +1178,9 @@ index 4a7bf8c..133a6fb 100644
 +      if (target) {
          command = training::lesson05_aiming(*target, input->timestamp, input->bullet_speed);
 +        // 火控：有解且允许开火时持续请求发射；云台对齐后弹丸自然命中。
-+        if (command.control && devices.config.allow_fire) command.shoot = true;
++        if (command.control && devices.config.allow_fire && tracking.settle_frames == 0) {
++          command.shoot = true;
++        }
 +
 +      }
 +

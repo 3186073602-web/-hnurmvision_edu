@@ -146,7 +146,9 @@ int main(int argc, char** argv) {
       if (target) {
         command = training::lesson05_aiming(*target, input->timestamp, input->bullet_speed);
         // 火控：有解且允许开火时持续请求发射；云台对齐后弹丸自然命中。
-        if (command.control && devices.config.allow_fire) command.shoot = true;
+        if (command.control && devices.config.allow_fire && tracking.settle_frames == 0) {
+          command.shoot = true;
+        }
 
       }
 

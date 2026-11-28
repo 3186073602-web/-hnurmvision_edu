@@ -17,5 +17,7 @@ struct TrackingState {
       Eigen::Matrix3d::Identity(), Eigen::Matrix3d::Identity(), Eigen::Matrix3d::Identity()};
   double last_time_sec = 0.0;
   double last_distance = 0.0;  // m，PnP 距离，用于选板
+  // 换板后的稳定期：这段时间内重新估计速度，先别开火（避免拿旧速度打空）。
+  int settle_frames = 0;
 };
 }  // namespace training
