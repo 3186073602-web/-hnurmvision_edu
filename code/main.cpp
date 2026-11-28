@@ -143,13 +143,27 @@ int main(int argc, char** argv) {
       }
       const auto target = training::lesson04_tracking(
           armors, input->timestamp, input->imu_q, input->gimbal_origin, calibration, tracking);
+      // 丢目标时慢速旋转搜索：云台世界 yaw 从底盘姿态 × 云台局部姿态得到，
+      // 所以底盘转过之后这里仍然是对的方向。找到目标就自动切回正常瞄准。
+      static double search_yaw = 0.0;
+      static bool has_search_yaw = false;
       if (target) {
         command = training::lesson05_aiming(*target, input->timestamp, input->bullet_speed);
-        // 火控：有解且允许开火时持续请求发射；云台对齐后弹丸自然命中。
         if (command.control && devices.config.allow_fire && tracking.settle_frames == 0) {
           command.shoot = true;
         }
-
+        if (command.control) has_search_yaw = false;
+      } else {
+        if (!has_search_yaw) {
+          const Eigen::Matrix3d rotation = input->imu_q.toRotationMatrix();
+          search_yaw = std::atan2(rotation(1, 0), rotation(0, 0));
+          has_search_yaw = true;
+        }
+        search_yaw += 0.035;  // ≈1.75 rad/s，约 3.6 s 转一圈
+        command.control = true;
+        command.shoot = false;
+        command.yaw = search_yaw;
+        command.pitch = 25.0 * M_PI / 180.0;  // 相机水平，方便搜索
       }
 
       // 第四讲可视化：PnP 位姿 vs 仿真真值；预测 250ms 后的位置并统计误差。

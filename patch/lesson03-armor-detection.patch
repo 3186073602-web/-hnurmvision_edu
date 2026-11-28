@@ -125,10 +125,10 @@ index 04b8637..cb58372 100644
        1303.6753236814714, 0, 720, 0, 1303.6753236814714, 540, 0, 0, 1};
    std::array<double, 5> distort_coeffs{0, 0, 0, 0, 0};
 diff --git a/lessons/lesson02_io.cpp b/lessons/lesson02_io.cpp
-index a7f8efc..b01440f 100644
+index a7f8efc..bb86362 100644
 --- a/lessons/lesson02_io.cpp
 +++ b/lessons/lesson02_io.cpp
-@@ -1,20 +1,209 @@
+@@ -1,20 +1,226 @@
  #include "io_context.hpp"
 +
 +#include "vision_gt.hpp"
@@ -172,6 +172,13 @@ index a7f8efc..b01440f 100644
 +  std::map<std::string, Eigen::Vector3d> armor_positions;
 +  Eigen::Vector3d gimbal_position = Eigen::Vector3d::Zero();
 +  Eigen::Quaterniond gimbal_rotation = Eigen::Quaterniond::Identity();
++  // 底盘（odom）与云台的局部量：云台世界姿态 = 底盘姿态 × 云台局部姿态。
++  // 只看 gimbal_link 的局部旋转会在底盘转向后丢掉底盘角，导致 yaw 全错。
++  Eigen::Vector3d odom_position = Eigen::Vector3d::Zero();
++  Eigen::Quaterniond odom_rotation = Eigen::Quaterniond::Identity();
++  Eigen::Vector3d gimbal_local_position = Eigen::Vector3d::Zero();
++  Eigen::Quaterniond gimbal_local_rotation = Eigen::Quaterniond::Identity();
++  bool has_odom = false;
 +  bool has_gimbal = false;
 +};
 +
@@ -188,11 +195,15 @@ index a7f8efc..b01440f 100644
 +    const auto& t = tf.transform.translation;
 +    const auto& q = tf.transform.rotation;
 +    if (child == "odom") {
-+      // map -> odom：云台在 map 系中的平移就是这里记录的平移。
-+      b.gimbal_position = Eigen::Vector3d(t.x, t.y, t.z);
++      // map -> odom：底盘在世界系中的位姿。
++      b.odom_position = Eigen::Vector3d(t.x, t.y, t.z);
++      b.odom_rotation = Eigen::Quaterniond(q.w, q.x, q.y, q.z);
++      b.has_odom = true;
++      b.gimbal_position = b.odom_position;  // 兜底：没有 gimbal_link 时用底盘位置
 +    } else if (child == "gimbal_link") {
-+      // odom -> gimbal_link：平移为零，旋转为云台姿态。
-+      b.gimbal_rotation = Eigen::Quaterniond(q.w, q.x, q.y, q.z);
++      // odom -> gimbal_link：云台相对底盘的局部位姿。
++      b.gimbal_local_position = Eigen::Vector3d(t.x, t.y, t.z);
++      b.gimbal_local_rotation = Eigen::Quaterniond(q.w, q.x, q.y, q.z);
 +      b.has_gimbal = true;
 +    } else if (child.rfind("armor_", 0) == 0) {
 +      b.armor_positions[child] = Eigen::Vector3d(t.x, t.y, t.z);
@@ -294,9 +305,15 @@ index a7f8efc..b01440f 100644
 +  data.timestamp = stamp;
 +  {
 +    std::lock_guard<std::mutex> lock(b.mutex);
-+    data.imu_q = b.has_gimbal ? b.gimbal_rotation.normalized()
-+                              : Eigen::Quaterniond::Identity();
-+    data.gimbal_origin = b.gimbal_position;
++    if (b.has_gimbal) {
++      const Eigen::Quaterniond base = b.has_odom ? b.odom_rotation.normalized()
++                                                 : Eigen::Quaterniond::Identity();
++      data.imu_q = (base * b.gimbal_local_rotation.normalized()).normalized();
++      data.gimbal_origin = b.odom_position + base * b.gimbal_local_position;
++    } else {
++      data.imu_q = Eigen::Quaterniond::Identity();
++      data.gimbal_origin = b.odom_position;
++    }
 +  }
 +  data.bullet_speed = 25.0;  // 仿真弹速，第四讲预测与第五讲解算使用
 +  return data;
@@ -1026,10 +1043,10 @@ index bb2b357..ba7efc3 100644
  }
  }  // namespace training
 diff --git a/src/main.cpp b/src/main.cpp
-index 4a7bf8c..6129c78 100644
+index 4a7bf8c..52e2f4a 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
-@@ -1,12 +1,106 @@
+@@ -1,13 +1,107 @@
  #include "lessons.hpp"
  #include "io_context.hpp"
 +#include "vision_gt.hpp"
@@ -1078,8 +1095,8 @@ index 4a7bf8c..6129c78 100644
 +  std::snprintf(label, sizeof(label), "RUNE %.2f", rune.confidence);
 +  cv::putText(frame, label, cv::Point(polygon[0].x, std::max(14, polygon[0].y - 6)),
 +              cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 235, 255), 1, cv::LINE_AA);
-+}
-+
+ }
+ 
 +void drawArmors(cv::Mat& frame, const std::vector<training::Armor>& armors) {
 +  // 只影响显示：检测角点是灯条外沿（P nP 用的物理尺寸），画框时外扩到整块板。
 +  constexpr float kWiden = 1.35F;
@@ -1131,12 +1148,13 @@ index 4a7bf8c..6129c78 100644
 +                cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 255), 2,
 +                cv::LINE_AA);
 +  }
- }
++}
 +}  // namespace
- 
++
  int main(int argc, char** argv) {
    std::signal(SIGINT, on_signal);
-@@ -17,21 +111,134 @@ int main(int argc, char** argv) {
+   std::signal(SIGTERM, on_signal);
+@@ -17,21 +111,148 @@ int main(int argc, char** argv) {
    training::TrackingState tracking;
    devices.open();
  
@@ -1175,13 +1193,27 @@ index 4a7bf8c..6129c78 100644
 -          armors, input->timestamp, input->imu_q, calibration, tracking);
 -      if (target)
 +          armors, input->timestamp, input->imu_q, input->gimbal_origin, calibration, tracking);
++      // 丢目标时慢速旋转搜索：云台世界 yaw 从底盘姿态 × 云台局部姿态得到，
++      // 所以底盘转过之后这里仍然是对的方向。找到目标就自动切回正常瞄准。
++      static double search_yaw = 0.0;
++      static bool has_search_yaw = false;
 +      if (target) {
          command = training::lesson05_aiming(*target, input->timestamp, input->bullet_speed);
-+        // 火控：有解且允许开火时持续请求发射；云台对齐后弹丸自然命中。
 +        if (command.control && devices.config.allow_fire && tracking.settle_frames == 0) {
 +          command.shoot = true;
 +        }
-+
++        if (command.control) has_search_yaw = false;
++      } else {
++        if (!has_search_yaw) {
++          const Eigen::Matrix3d rotation = input->imu_q.toRotationMatrix();
++          search_yaw = std::atan2(rotation(1, 0), rotation(0, 0));
++          has_search_yaw = true;
++        }
++        search_yaw += 0.035;  // ≈1.75 rad/s，约 3.6 s 转一圈
++        command.control = true;
++        command.shoot = false;
++        command.yaw = search_yaw;
++        command.pitch = 25.0 * M_PI / 180.0;  // 相机水平，方便搜索
 +      }
 +
 +      // 第四讲可视化：PnP 位姿 vs 仿真真值；预测 250ms 后的位置并统计误差。

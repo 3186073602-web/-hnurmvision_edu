@@ -41,6 +41,13 @@ struct Bridge {
   std::map<std::string, Eigen::Vector3d> armor_positions;
   Eigen::Vector3d gimbal_position = Eigen::Vector3d::Zero();
   Eigen::Quaterniond gimbal_rotation = Eigen::Quaterniond::Identity();
+  // 底盘（odom）与云台的局部量：云台世界姿态 = 底盘姿态 × 云台局部姿态。
+  // 只看 gimbal_link 的局部旋转会在底盘转向后丢掉底盘角，导致 yaw 全错。
+  Eigen::Vector3d odom_position = Eigen::Vector3d::Zero();
+  Eigen::Quaterniond odom_rotation = Eigen::Quaterniond::Identity();
+  Eigen::Vector3d gimbal_local_position = Eigen::Vector3d::Zero();
+  Eigen::Quaterniond gimbal_local_rotation = Eigen::Quaterniond::Identity();
+  bool has_odom = false;
   bool has_gimbal = false;
 };
 
@@ -57,11 +64,15 @@ void onTf(const tf2_msgs::msg::TFMessage::SharedPtr msg) {
     const auto& t = tf.transform.translation;
     const auto& q = tf.transform.rotation;
     if (child == "odom") {
-      // map -> odom：云台在 map 系中的平移就是这里记录的平移。
-      b.gimbal_position = Eigen::Vector3d(t.x, t.y, t.z);
+      // map -> odom：底盘在世界系中的位姿。
+      b.odom_position = Eigen::Vector3d(t.x, t.y, t.z);
+      b.odom_rotation = Eigen::Quaterniond(q.w, q.x, q.y, q.z);
+      b.has_odom = true;
+      b.gimbal_position = b.odom_position;  // 兜底：没有 gimbal_link 时用底盘位置
     } else if (child == "gimbal_link") {
-      // odom -> gimbal_link：平移为零，旋转为云台姿态。
-      b.gimbal_rotation = Eigen::Quaterniond(q.w, q.x, q.y, q.z);
+      // odom -> gimbal_link：云台相对底盘的局部位姿。
+      b.gimbal_local_position = Eigen::Vector3d(t.x, t.y, t.z);
+      b.gimbal_local_rotation = Eigen::Quaterniond(q.w, q.x, q.y, q.z);
       b.has_gimbal = true;
     } else if (child.rfind("armor_", 0) == 0) {
       b.armor_positions[child] = Eigen::Vector3d(t.x, t.y, t.z);
@@ -161,9 +172,15 @@ std::optional<SensorData> IoContext::read() {
   data.timestamp = stamp;
   {
     std::lock_guard<std::mutex> lock(b.mutex);
-    data.imu_q = b.has_gimbal ? b.gimbal_rotation.normalized()
-                              : Eigen::Quaterniond::Identity();
-    data.gimbal_origin = b.gimbal_position;
+    if (b.has_gimbal) {
+      const Eigen::Quaterniond base = b.has_odom ? b.odom_rotation.normalized()
+                                                 : Eigen::Quaterniond::Identity();
+      data.imu_q = (base * b.gimbal_local_rotation.normalized()).normalized();
+      data.gimbal_origin = b.odom_position + base * b.gimbal_local_position;
+    } else {
+      data.imu_q = Eigen::Quaterniond::Identity();
+      data.gimbal_origin = b.odom_position;
+    }
   }
   data.bullet_speed = 25.0;  // 仿真弹速，第四讲预测与第五讲解算使用
   return data;
