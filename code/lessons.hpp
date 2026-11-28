@@ -6,6 +6,7 @@
 
 namespace training {
 std::vector<Armor> lesson03_detection(const cv::Mat& image);
+void setMinArmorConfidence(float value);
 
 // 能量机关（能量装置）观测：每个圆形小装置一个紧贴的小框 + 置信度。
 struct Rune {

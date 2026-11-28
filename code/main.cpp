@@ -123,6 +123,7 @@ int main(int argc, char** argv) {
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
   const auto config = training::load_config(argc > 1 ? argv[1] : "configs/simulation.yaml");
+  training::setMinArmorConfidence(static_cast<float>(config.min_armor_confidence));
   const auto calibration = training::load_calibration(config);
   training::io::IoContext devices{config};
   training::TrackingState tracking;

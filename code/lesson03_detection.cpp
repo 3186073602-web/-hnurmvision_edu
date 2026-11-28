@@ -38,7 +38,7 @@ constexpr float kMaxGapRatio = 4.50F;
 constexpr float kMinArmorAspect = 1.60F;  // 装甲板外接框 宽/高
 constexpr float kMaxArmorAspect = 5.00F;
 constexpr float kLargeArmorAspect = 2.85F; // 超过即视为大装甲板（哨兵）
-constexpr float kMinConfidence = 0.62F;
+float g_minConfidence = 0.62F;  // 可由 config 调整（0~1）
 constexpr float kSuppressIou = 0.45F;
 
 struct LightBar {
@@ -154,6 +154,10 @@ float iou(const std::array<cv::Point2f, 4>& a, const std::array<cv::Point2f, 4>&
 
 }  // namespace
 
+void setMinArmorConfidence(float value) {
+  g_minConfidence = std::clamp(value, 0.0F, 0.99F);
+}
+
 std::vector<Armor> lesson03_detection(const cv::Mat& image) {
   if (image.empty() || image.type() != CV_8UC3) return {};
 
@@ -240,7 +244,7 @@ std::vector<Armor> lesson03_detection(const cv::Mat& image) {
           std::exp(-0.5F * std::pow((gap_ratio - ideal_gap) / 0.9F, 2.0F));
       const float confidence =
           0.45F * size_score + 0.30F * angle_score + 0.25F * gap_score;
-      if (confidence < kMinConfidence) continue;
+      if (confidence < g_minConfidence) continue;
 
       Armor armor;
       // 角点保持灯条外沿（≈ 真实板 135×55 mm），PnP 依赖这个物理尺寸；

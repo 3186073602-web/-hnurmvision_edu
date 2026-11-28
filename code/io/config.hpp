@@ -14,6 +14,8 @@ struct Config {
   bool show_diagnostics = false;
   // 独立位姿测量模式：只算 PnP/跟踪，不向云台发任何指令（用于评估位姿稳定性）。
   bool pose_only = false;
+  // 装甲板检测的最低置信度（可视化里的 SMALL 0.xx 那个数）。
+  double min_armor_confidence = 0.62;
   std::array<double, 9> camera_matrix{
       1303.6753236814714, 0, 720, 0, 1303.6753236814714, 540, 0, 0, 1};
   std::array<double, 5> distort_coeffs{0, 0, 0, 0, 0};
