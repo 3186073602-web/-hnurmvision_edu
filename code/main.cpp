@@ -210,9 +210,12 @@ int main(int argc, char** argv) {
                                           0.5 * target->acceleration * kPredictAhead * kPredictAhead;
         predictions.emplace_back(now_sec, predicted);
 
-        // 画 250ms 后的预测框（青色）：预测点投回图像，框按距离缩放。
-        if (!armors.empty()) {
-          if (const auto predicted_px = projectWorld(predicted, input->imu_q, input->gimbal_origin, calibration)) {
+        // 画 250ms 后的预测框（青色，仅调试开关打开时）。predicted 是相对云台
+        // 原点的向量，投影前要先加回原点，否则框会被甩到十几米外。
+        if (devices.config.show_prediction && !armors.empty()) {
+          if (const auto predicted_px = projectWorld(
+                  predicted + input->gimbal_origin, input->imu_q, input->gimbal_origin,
+                  calibration)) {
             const cv::Rect2f box = cv::boundingRect(armors.front().corners);
             const double current_z = target->position.norm();
             const double predicted_z = predicted.norm();
@@ -252,7 +255,7 @@ int main(int argc, char** argv) {
           cv::putText(input->image, line, cv::Point(24, 140), cv::FONT_HERSHEY_SIMPLEX,
                       0.7, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
         }
-        if (has_pred_error) {
+        if (devices.config.show_prediction && has_pred_error) {
           std::snprintf(line, sizeof(line), "pred error @250ms: %.1f cm", last_pred_error * 100.0);
           cv::putText(input->image, line, cv::Point(24, input->image.rows - 24),
                       cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
