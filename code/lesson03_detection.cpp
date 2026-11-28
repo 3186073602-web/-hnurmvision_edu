@@ -241,8 +241,21 @@ std::vector<Armor> lesson03_detection(const cv::Mat& image) {
   std::vector<Armor> kept;
   for (const auto& armor : armors) {
     bool duplicate = false;
+    const cv::Rect2f box = cv::boundingRect(armor.corners);
     for (const auto& other : kept) {
-      if (iou(armor.corners, other.corners) > kSuppressIou) {
+      const cv::Rect2f other_box = cv::boundingRect(other.corners);
+      // 同一块板的重复检测往往只重叠 30%~40%，单靠 IoU 抑制不掉；
+      // 再补一条“中心很近且尺寸接近”的判据，避免同一块板输出两个框。
+      const float dx = (box.x + box.width * 0.5F) - (other_box.x + other_box.width * 0.5F);
+      const float dy = (box.y + box.height * 0.5F) - (other_box.y + other_box.height * 0.5F);
+      const float center_distance = std::sqrt(dx * dx + dy * dy);
+      const float width_ratio = box.width / std::max(1.0F, other_box.width);
+      const float height_ratio = box.height / std::max(1.0F, other_box.height);
+      const bool near_duplicate =
+          center_distance < 0.55F * std::max(box.width, other_box.width) &&
+          width_ratio > 0.6F && width_ratio < 1.7F &&
+          height_ratio > 0.6F && height_ratio < 1.7F;
+      if (iou(armor.corners, other.corners) > kSuppressIou || near_duplicate) {
         duplicate = true;
         break;
       }
