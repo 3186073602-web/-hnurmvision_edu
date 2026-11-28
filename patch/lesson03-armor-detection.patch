@@ -1,8 +1,8 @@
 diff --git a/configs/simulation.yaml b/configs/simulation.yaml
-index ae82170..f2db650 100644
+index ae82170..0a85026 100644
 --- a/configs/simulation.yaml
 +++ b/configs/simulation.yaml
-@@ -1,6 +1,9 @@
+@@ -1,6 +1,11 @@
  # 只需要修改显示、发射许可和相机标定。
  display: true
 -allow_fire: false
@@ -10,10 +10,12 @@ index ae82170..f2db650 100644
 +# 能量机关检测开关：前两项（静止/平移）保持 false，只打装甲板；
 +# 旋转靶若需要再看，改成 true。
 +enable_rune: false
++# 是否显示 250ms 预测框和预测误差（调试用）
++show_prediction: false
  
  # 仿真环境下的相机内参
  camera_matrix: [1303.6753236814714, 0.0, 720.0,
-@@ -10,7 +13,9 @@ distort_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
+@@ -10,7 +15,9 @@ distort_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
  
  # 相机光学坐标系到云台坐标系：p_gimbal = R * p_camera + t。
  # vehicle.glb 中相机/枪口固定仰角为 25°。
@@ -100,27 +102,30 @@ index 53d64e7..d5f728d 100644
  
  // 第五讲输出：绝对角使用 rad，IO 边界统一转换单位和方向。
 diff --git a/io/config.cpp b/io/config.cpp
-index 7746963..53221ed 100644
+index 7746963..855cd03 100644
 --- a/io/config.cpp
 +++ b/io/config.cpp
-@@ -24,6 +24,7 @@ Config load_config(const std::string& path) {
+@@ -24,6 +24,8 @@ Config load_config(const std::string& path) {
    Config c;
    if (y["display"]) c.display = y["display"].as<bool>();
    if (y["allow_fire"]) c.allow_fire = y["allow_fire"].as<bool>();
 +  if (y["enable_rune"]) c.enable_rune = y["enable_rune"].as<bool>();
++  if (y["show_prediction"]) c.show_prediction = y["show_prediction"].as<bool>();
    read_array(y, "camera_matrix", c.camera_matrix);
    read_array(y, "distort_coeffs", c.distort_coeffs);
    read_array(y, "R_camera2gimbal", c.camera_to_gimbal);
 diff --git a/io/config.hpp b/io/config.hpp
-index 04b8637..cb58372 100644
+index 04b8637..fa547a0 100644
 --- a/io/config.hpp
 +++ b/io/config.hpp
-@@ -6,6 +6,8 @@ namespace training {
+@@ -6,6 +6,10 @@ namespace training {
  struct Config {
    bool display = true;
    bool allow_fire = false;
 +  // 是否启用能量机关检测（默认关闭：前两项考核只打装甲板，省算力也避免干扰）。
 +  bool enable_rune = false;
++  // 是否画 250ms 预测框与预测误差（调试用，默认关闭）。
++  bool show_prediction = false;
    std::array<double, 9> camera_matrix{
        1303.6753236814714, 0, 720, 0, 1303.6753236814714, 540, 0, 0, 1};
    std::array<double, 5> distort_coeffs{0, 0, 0, 0, 0};
@@ -1051,7 +1056,7 @@ index bb2b357..ba7efc3 100644
  }
  }  // namespace training
 diff --git a/src/main.cpp b/src/main.cpp
-index 4a7bf8c..52e2f4a 100644
+index 4a7bf8c..5f91a5b 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
 @@ -1,13 +1,107 @@
@@ -1162,7 +1167,7 @@ index 4a7bf8c..52e2f4a 100644
  int main(int argc, char** argv) {
    std::signal(SIGINT, on_signal);
    std::signal(SIGTERM, on_signal);
-@@ -17,21 +111,148 @@ int main(int argc, char** argv) {
+@@ -17,21 +111,152 @@ int main(int argc, char** argv) {
    training::TrackingState tracking;
    devices.open();
  
@@ -1238,8 +1243,9 @@ index 4a7bf8c..52e2f4a 100644
 +        // 真值：/tf 中离 PnP 结果最近的装甲板中心（云台系）。
 +        // 位姿误差只在近似静止时显示：靶车在动时真值关联和框抖动都会放大误差。
 +        if (target->velocity.norm() < 0.2) {
-+          if (const auto gt = training::io::nearestArmorInGimbal(target->position)) {
-+            last_pose_error = (target->position - *gt).norm();
++          const Eigen::Vector3d in_gimbal = input->imu_q.inverse() * target->position;
++          if (const auto gt = training::io::nearestArmorInGimbal(in_gimbal)) {
++            last_pose_error = (in_gimbal - *gt).norm();
 +            has_pose_error = true;
 +          }
 +        } else {
@@ -1250,9 +1256,11 @@ index 4a7bf8c..52e2f4a 100644
 +                                          0.5 * target->acceleration * kPredictAhead * kPredictAhead;
 +        predictions.emplace_back(now_sec, predicted);
 +
-+        // 画 250ms 后的预测框（青色）：预测点投回图像，框按距离缩放。
-+        if (!armors.empty()) {
-+          if (const auto predicted_px = projectWorld(predicted, input->imu_q, input->gimbal_origin, calibration)) {
++        // 画 250ms 后的预测框（青色，调试开关控制）。predicted 是相对云台原点的
++        // 向量，投回图像时先加回原点再走 projectWorld。
++        if (devices.config.show_prediction && !armors.empty()) {
++          if (const auto predicted_px = projectWorld(
++                  predicted + input->gimbal_origin, input->imu_q, input->gimbal_origin, calibration)) {
 +            const cv::Rect2f box = cv::boundingRect(armors.front().corners);
 +            const double current_z = target->position.norm();
 +            const double predicted_z = predicted.norm();
@@ -1270,7 +1278,8 @@ index 4a7bf8c..52e2f4a 100644
 +        }
 +
 +        // 250ms 后：预测位置与该时刻实际观测到的目标位置比较，误差显示在左下角。
-+        while (!predictions.empty() && now_sec - predictions.front().first >= kPredictAhead) {
++        while (devices.config.show_prediction && !predictions.empty() &&
++               now_sec - predictions.front().first >= kPredictAhead) {
 +          const Eigen::Vector3d predicted_at = predictions.front().second;
 +          predictions.pop_front();
 +          last_pred_error = (predicted_at - target->position).norm();
@@ -1292,7 +1301,7 @@ index 4a7bf8c..52e2f4a 100644
 +          cv::putText(input->image, line, cv::Point(24, 140), cv::FONT_HERSHEY_SIMPLEX,
 +                      0.7, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
 +        }
-+        if (has_pred_error) {
++        if (devices.config.show_prediction && has_pred_error) {
 +          std::snprintf(line, sizeof(line), "pred error @250ms: %.1f cm", last_pred_error * 100.0);
 +          cv::putText(input->image, line, cv::Point(24, input->image.rows - 24),
 +                      cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);

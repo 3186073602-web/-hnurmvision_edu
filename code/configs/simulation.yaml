@@ -4,6 +4,8 @@ allow_fire: true
 # 能量机关检测开关：前两项（静止/平移）保持 false，只打装甲板；
 # 旋转靶若需要再看，改成 true。
 enable_rune: false
+# 是否显示 250ms 预测框和预测误差（调试用）
+show_prediction: false
 
 # 仿真环境下的相机内参
 camera_matrix: [1303.6753236814714, 0.0, 720.0,

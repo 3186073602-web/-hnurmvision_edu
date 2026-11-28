@@ -8,6 +8,8 @@ struct Config {
   bool allow_fire = false;
   // 是否启用能量机关检测（默认关闭：前两项考核只打装甲板，省算力也避免干扰）。
   bool enable_rune = false;
+  // 是否画 250ms 预测框与预测误差（调试用，默认关闭）。
+  bool show_prediction = false;
   std::array<double, 9> camera_matrix{
       1303.6753236814714, 0, 720, 0, 1303.6753236814714, 540, 0, 0, 1};
   std::array<double, 5> distort_coeffs{0, 0, 0, 0, 0};

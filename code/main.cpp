@@ -180,8 +180,9 @@ int main(int argc, char** argv) {
         // 真值：/tf 中离 PnP 结果最近的装甲板中心（云台系）。
         // 位姿误差只在近似静止时显示：靶车在动时真值关联和框抖动都会放大误差。
         if (target->velocity.norm() < 0.2) {
-          if (const auto gt = training::io::nearestArmorInGimbal(target->position)) {
-            last_pose_error = (target->position - *gt).norm();
+          const Eigen::Vector3d in_gimbal = input->imu_q.inverse() * target->position;
+          if (const auto gt = training::io::nearestArmorInGimbal(in_gimbal)) {
+            last_pose_error = (in_gimbal - *gt).norm();
             has_pose_error = true;
           }
         } else {
@@ -192,9 +193,11 @@ int main(int argc, char** argv) {
                                           0.5 * target->acceleration * kPredictAhead * kPredictAhead;
         predictions.emplace_back(now_sec, predicted);
 
-        // 画 250ms 后的预测框（青色）：预测点投回图像，框按距离缩放。
-        if (!armors.empty()) {
-          if (const auto predicted_px = projectWorld(predicted, input->imu_q, input->gimbal_origin, calibration)) {
+        // 画 250ms 后的预测框（青色，调试开关控制）。predicted 是相对云台原点的
+        // 向量，投回图像时先加回原点再走 projectWorld。
+        if (devices.config.show_prediction && !armors.empty()) {
+          if (const auto predicted_px = projectWorld(
+                  predicted + input->gimbal_origin, input->imu_q, input->gimbal_origin, calibration)) {
             const cv::Rect2f box = cv::boundingRect(armors.front().corners);
             const double current_z = target->position.norm();
             const double predicted_z = predicted.norm();
@@ -212,7 +215,8 @@ int main(int argc, char** argv) {
         }
 
         // 250ms 后：预测位置与该时刻实际观测到的目标位置比较，误差显示在左下角。
-        while (!predictions.empty() && now_sec - predictions.front().first >= kPredictAhead) {
+        while (devices.config.show_prediction && !predictions.empty() &&
+               now_sec - predictions.front().first >= kPredictAhead) {
           const Eigen::Vector3d predicted_at = predictions.front().second;
           predictions.pop_front();
           last_pred_error = (predicted_at - target->position).norm();
@@ -234,7 +238,7 @@ int main(int argc, char** argv) {
           cv::putText(input->image, line, cv::Point(24, 140), cv::FONT_HERSHEY_SIMPLEX,
                       0.7, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
         }
-        if (has_pred_error) {
+        if (devices.config.show_prediction && has_pred_error) {
           std::snprintf(line, sizeof(line), "pred error @250ms: %.1f cm", last_pred_error * 100.0);
           cv::putText(input->image, line, cv::Point(24, input->image.rows - 24),
                       cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
