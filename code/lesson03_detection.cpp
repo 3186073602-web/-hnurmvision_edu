@@ -1,6 +1,7 @@
 #include "lessons.hpp"
 
 #include <opencv2/imgproc.hpp>
+#include <opencv2/imgcodecs.hpp>
 
 #include <algorithm>
 #include <array>
@@ -27,10 +28,10 @@ namespace {
 constexpr float kMinBarHeight = 16.0F;    // px，太小的灯条不可靠
 constexpr float kMinBarAspect = 1.55F;    // 高/宽，灯条是细长条
 constexpr float kMaxBarWidth = 90.0F;     // px，太宽的多半是车体反光
-constexpr double kMinBarArea = 22.0;      // px^2（远距离灯条只有二十几像素）
+constexpr double kMinBarArea = 14.0;      // px^2（远距离灯条只有十几像素）
 
 // 灯条配对的几何约束。
-constexpr float kMaxHeightDiff = 0.25F;   // 两条灯条高度差 / 较高者（收紧，排除车壳亮边）
+constexpr float kMaxHeightDiff = 0.50F;   // 斜视时两侧灯条高度差会变大，放宽
 constexpr float kMaxCenterOffset = 0.42F; // 竖直中心差 / 平均灯条高度
 constexpr float kMaxTiltDiff = 20.0F;     // 倾斜角差，单位度
 constexpr float kMinGapRatio = 0.28F;     // 灯条净间距 / 平均灯条高度
@@ -59,7 +60,7 @@ void buildColorMasks(const cv::Mat& hsv, cv::Mat& blue_mask, cv::Mat& red_mask) 
   // 远处/侧向的灯条偏暗（V 只有 60~120），单独补一张“暗灯条”掩膜，
   // 否则离远了或背光时整块装甲都检不出来。
   cv::Mat blue_dim;
-  cv::inRange(hsv, cv::Scalar(85, 110, 60), cv::Scalar(135, 255, 135), blue_dim);
+  cv::inRange(hsv, cv::Scalar(85, 95, 45), cv::Scalar(135, 255, 135), blue_dim);
   cv::bitwise_or(blue_low, blue_high, blue_mask);
   cv::bitwise_or(blue_mask, blue_dim, blue_mask);
 
@@ -68,7 +69,7 @@ void buildColorMasks(const cv::Mat& hsv, cv::Mat& blue_mask, cv::Mat& red_mask) 
   cv::inRange(hsv, cv::Scalar(0, 70, 190), cv::Scalar(12, 255, 255), red_low2);
   cv::inRange(hsv, cv::Scalar(168, 70, 190), cv::Scalar(180, 255, 255), red_high2);
   cv::Mat red_dim;
-  cv::inRange(hsv, cv::Scalar(0, 110, 60), cv::Scalar(12, 255, 135), red_dim);
+  cv::inRange(hsv, cv::Scalar(0, 95, 45), cv::Scalar(12, 255, 135), red_dim);
   cv::bitwise_or(red_low1, red_high1, red_mask);
   cv::bitwise_or(red_mask, red_low2, red_mask);
   cv::bitwise_or(red_mask, red_high2, red_mask);
@@ -159,6 +160,12 @@ void setMinArmorConfidence(float value) {
 }
 
 std::vector<Armor> lesson03_detection(const cv::Mat& image) {
+  if (std::getenv("LESSON03_DUMP") != nullptr) {
+    static int dump_count = 0;
+    if (++dump_count % 60 == 0) {
+      cv::imwrite("/tmp/det_dump.png", image);
+    }
+  }
   if (image.empty() || image.type() != CV_8UC3) return {};
 
   cv::Mat hsv;
@@ -172,6 +179,11 @@ std::vector<Armor> lesson03_detection(const cv::Mat& image) {
   cv::bitwise_or(blue_mask, red_mask, color_mask);
 
   std::vector<LightBar> bars = findLightBars(blue_mask, 0);
+  if (std::getenv("LESSON03_DEBUG") != nullptr) {
+    const size_t blue_count = bars.size();
+    std::vector<LightBar> probe_red = findLightBars(red_mask, 1);
+    std::fprintf(stderr, "[bars] blue=%zu red=%zu\n", blue_count, probe_red.size());
+  }
   std::vector<LightBar> red_bars = findLightBars(red_mask, 1);
   bars.insert(bars.end(), red_bars.begin(), red_bars.end());
 
@@ -190,12 +202,19 @@ std::vector<Armor> lesson03_detection(const cv::Mat& image) {
       const float mean_height = 0.5F * (left.height + right.height);
       const float height_diff =
           std::abs(left.height - right.height) / std::max(left.height, right.height);
-      if (height_diff > kMaxHeightDiff) continue;
+      const bool dbg = std::getenv("LESSON03_DEBUG") != nullptr;
+      if (height_diff > kMaxHeightDiff) {
+        if (dbg) std::fprintf(stderr, "[rej] height %.2f\n", height_diff);
+        continue;
+      }
 
       const float center_offset =
           std::abs(left.top.y + left.height * 0.5F - (right.top.y + right.height * 0.5F)) /
           mean_height;
-      if (center_offset > kMaxCenterOffset) continue;
+      if (center_offset > kMaxCenterOffset) {
+        if (dbg) std::fprintf(stderr, "[rej] center %.2f\n", center_offset);
+        continue;
+      }
 
       if (std::abs(left.tilt - right.tilt) > kMaxTiltDiff) continue;
 
@@ -209,19 +228,31 @@ std::vector<Armor> lesson03_detection(const cv::Mat& image) {
       const float gap = (right.top.x - right.width * 0.5F) -
                         (left.top.x + left.width * 0.5F);
       const float gap_ratio = gap / mean_height;
-      if (gap_ratio < kMinGapRatio || gap_ratio > kMaxGapRatio) continue;
+      const float provisional_width =
+          (right.top.x + right.width * 0.5F) - (left.top.x - left.width * 0.5F);
+      const bool small_box = provisional_width < 80.0F;  // 远距离的小目标
+      if (small_box) {
+        if (gap_ratio < 0.20F || gap_ratio > 6.0F) continue;
+      } else if (gap_ratio < kMinGapRatio || gap_ratio > kMaxGapRatio) {
+        if (dbg) std::fprintf(stderr, "[rej] gap %.2f\n", gap_ratio);
+        continue;
+      }
 
       const auto corners = makeCorners(left, right);
       // 用外接矩形判断大小板：斜着看时三角函数的宽度会被低估，bbox 更稳定。
       const cv::Rect2f box = cv::boundingRect(corners);
       if (box.height <= 1.0F) continue;
       const float aspect = box.width / box.height;
-      if (aspect < kMinArmorAspect || aspect > kMaxArmorAspect) continue;
+      const float min_aspect = box.width < 80.0F ? 1.35F : kMinArmorAspect;
+      if (aspect < min_aspect || aspect > kMaxArmorAspect) {
+        if (dbg) std::fprintf(stderr, "[rej] aspect %.2f w=%.0f h=%.0f\n", aspect, box.width, box.height);
+        continue;
+      }
 
       // 板面检查：真装甲板中间是“暗底 + 数字”，两条灯条只贴在左右边缘。
       // 如果框的中部还出现灯条颜色（说明这个框把另一块真板包了进去，
       // 典型是整车侧面被当成一块板），直接排除。
-      if (!color_mask.empty()) {
+      if (!color_mask.empty() && box.width >= 80.0F) {
         const int x0 = std::max(0, static_cast<int>(box.x + box.width * 0.30F));
         const int x1 = std::min(color_mask.cols, static_cast<int>(box.x + box.width * 0.70F));
         const int y0 = std::max(0, static_cast<int>(box.y + box.height * 0.15F));
@@ -230,7 +261,10 @@ std::vector<Armor> lesson03_detection(const cv::Mat& image) {
           const cv::Rect middle(x0, y0, x1 - x0, y1 - y0);
           const double colored = cv::countNonZero(color_mask(middle));
           const double fraction = colored / static_cast<double>(middle.area());
-          if (fraction > 0.12) continue;  // 中部有灯条颜色 → 不是一块板
+          if (fraction > 0.12) {
+            if (dbg) std::fprintf(stderr, "[rej] interior %.2f w=%.0f\n", fraction, box.width);
+            continue;  // 中部有灯条颜色 → 不是一块板
+          }
         }
       }
 
@@ -244,7 +278,15 @@ std::vector<Armor> lesson03_detection(const cv::Mat& image) {
           std::exp(-0.5F * std::pow((gap_ratio - ideal_gap) / 0.9F, 2.0F));
       const float confidence =
           0.45F * size_score + 0.30F * angle_score + 0.25F * gap_score;
-      if (confidence < g_minConfidence) continue;
+      // 近距离的框大，假框（整车侧面）也大，要求更高的置信度；
+      // 远距离的框小、评分天然偏低，用较低的阈值，避免远靶直接丢检测。
+      const float required_confidence =
+          box.width > 120.0F ? std::max(0.80F, g_minConfidence)
+                             : (box.width < 80.0F ? 0.50F : g_minConfidence);
+      if (confidence < required_confidence) {
+        if (dbg) std::fprintf(stderr, "[rej] conf %.2f < %.2f w=%.0f\n", confidence, required_confidence, box.width);
+        continue;
+      }
 
       Armor armor;
       // 角点保持灯条外沿（≈ 真实板 135×55 mm），PnP 依赖这个物理尺寸；
