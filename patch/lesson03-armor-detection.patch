@@ -359,10 +359,10 @@ index a7f8efc..bb86362 100644
  }
  }  // namespace training::io
 diff --git a/lessons/lesson03_detection.cpp b/lessons/lesson03_detection.cpp
-index c9cbbd8..91958c8 100644
+index c9cbbd8..5a8a5ae 100644
 --- a/lessons/lesson03_detection.cpp
 +++ b/lessons/lesson03_detection.cpp
-@@ -1,13 +1,332 @@
+@@ -1,13 +1,340 @@
  #include "lessons.hpp"
  
 +#include <opencv2/imgproc.hpp>
@@ -396,7 +396,7 @@ index c9cbbd8..91958c8 100644
 +constexpr float kMinBarHeight = 16.0F;    // px，太小的灯条不可靠
 +constexpr float kMinBarAspect = 1.55F;    // 高/宽，灯条是细长条
 +constexpr float kMaxBarWidth = 90.0F;     // px，太宽的多半是车体反光
-+constexpr double kMinBarArea = 35.0;      // px^2
++constexpr double kMinBarArea = 22.0;      // px^2（远距离灯条只有二十几像素）
 +
 +// 灯条配对的几何约束。
 +constexpr float kMaxHeightDiff = 0.40F;   // 两条灯条高度差 / 较高者
@@ -425,15 +425,23 @@ index c9cbbd8..91958c8 100644
 +  cv::Mat blue_low, blue_high, red_low1, red_high1, red_low2, red_high2;
 +  cv::inRange(hsv, cv::Scalar(85, 120, 120), cv::Scalar(135, 255, 255), blue_low);
 +  cv::inRange(hsv, cv::Scalar(85, 60, 190), cv::Scalar(135, 255, 255), blue_high);
++  // 远处/侧向的灯条偏暗（V 只有 60~120），单独补一张“暗灯条”掩膜，
++  // 否则离远了或背光时整块装甲都检不出来。
++  cv::Mat blue_dim;
++  cv::inRange(hsv, cv::Scalar(85, 110, 60), cv::Scalar(135, 255, 135), blue_dim);
 +  cv::bitwise_or(blue_low, blue_high, blue_mask);
++  cv::bitwise_or(blue_mask, blue_dim, blue_mask);
 +
 +  cv::inRange(hsv, cv::Scalar(0, 130, 130), cv::Scalar(12, 255, 255), red_low1);
 +  cv::inRange(hsv, cv::Scalar(168, 130, 130), cv::Scalar(180, 255, 255), red_high1);
 +  cv::inRange(hsv, cv::Scalar(0, 70, 190), cv::Scalar(12, 255, 255), red_low2);
 +  cv::inRange(hsv, cv::Scalar(168, 70, 190), cv::Scalar(180, 255, 255), red_high2);
++  cv::Mat red_dim;
++  cv::inRange(hsv, cv::Scalar(0, 110, 60), cv::Scalar(12, 255, 135), red_dim);
 +  cv::bitwise_or(red_low1, red_high1, red_mask);
 +  cv::bitwise_or(red_mask, red_low2, red_mask);
 +  cv::bitwise_or(red_mask, red_high2, red_mask);
++  cv::bitwise_or(red_mask, red_dim, red_mask);
 +
 +  // 灯条偶尔会被号码/支架切断，闭运算把同一根灯条上的碎片接回去。
 +  const cv::Mat kernel =
