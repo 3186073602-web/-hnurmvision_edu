@@ -944,13 +944,14 @@ index c9cbbd8..b7587d5 100644
  }
  }  // namespace training
 diff --git a/lessons/lesson04_tracking.cpp b/lessons/lesson04_tracking.cpp
-index d0a03a2..0e323ed 100644
+index d0a03a2..82b0caa 100644
 --- a/lessons/lesson04_tracking.cpp
 +++ b/lessons/lesson04_tracking.cpp
-@@ -1,28 +1,257 @@
+@@ -1,28 +1,261 @@
  #include "lessons.hpp"
  
 +#include <opencv2/calib3d.hpp>
++#include <opencv2/imgproc.hpp>
 +
 +#include <algorithm>
 +#include <cmath>
@@ -1122,7 +1123,10 @@ index d0a03a2..0e323ed 100644
 +    const Eigen::Vector3d world_xyz = imu_q * gimbal_xyz + world_origin;
 +
 +    const double distance = world_xyz.norm();
-+    const double score = tracking ? (world_xyz - state.position).norm() : distance;
++    const double box_width = cv::boundingRect(armor.corners).width;
++    // 未锁定时优先选“最正对相机”的板（框最宽），侧板虽然也可能被检出，
++    // 但打它没有意义，而且会让速度估计乱跳。
++    const double score = tracking ? (world_xyz - state.position).norm() : -box_width;
 +    if (!found || score < best_score) {
 +      found = true;
 +      best_score = score;
@@ -1131,7 +1135,7 @@ index d0a03a2..0e323ed 100644
 +      state.last_camera_xyz = camera_xyz;
 +    }
 +  }
-+  if (tracking && found && best_score > 0.8) {
++  if (tracking && found && best_score > 0.35) {
 +    // 跳变过大：当作重新捕获，用最近的板。
 +    found = false;
 +    for (const auto& armor : armors) {
