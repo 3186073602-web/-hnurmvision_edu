@@ -1,16 +1,19 @@
 diff --git a/configs/simulation.yaml b/configs/simulation.yaml
-index ae82170..d07e61c 100644
+index ae82170..f2db650 100644
 --- a/configs/simulation.yaml
 +++ b/configs/simulation.yaml
-@@ -1,6 +1,6 @@
+@@ -1,6 +1,9 @@
  # 只需要修改显示、发射许可和相机标定。
  display: true
 -allow_fire: false
 +allow_fire: true
++# 能量机关检测开关：前两项（静止/平移）保持 false，只打装甲板；
++# 旋转靶若需要再看，改成 true。
++enable_rune: false
  
  # 仿真环境下的相机内参
  camera_matrix: [1303.6753236814714, 0.0, 720.0,
-@@ -10,7 +10,9 @@ distort_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
+@@ -10,7 +13,9 @@ distort_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
  
  # 相机光学坐标系到云台坐标系：p_gimbal = R * p_camera + t。
  # vehicle.glb 中相机/枪口固定仰角为 25°。
@@ -94,6 +97,31 @@ index 53d64e7..d5f728d 100644
  };
  
  // 第五讲输出：绝对角使用 rad，IO 边界统一转换单位和方向。
+diff --git a/io/config.cpp b/io/config.cpp
+index 7746963..53221ed 100644
+--- a/io/config.cpp
++++ b/io/config.cpp
+@@ -24,6 +24,7 @@ Config load_config(const std::string& path) {
+   Config c;
+   if (y["display"]) c.display = y["display"].as<bool>();
+   if (y["allow_fire"]) c.allow_fire = y["allow_fire"].as<bool>();
++  if (y["enable_rune"]) c.enable_rune = y["enable_rune"].as<bool>();
+   read_array(y, "camera_matrix", c.camera_matrix);
+   read_array(y, "distort_coeffs", c.distort_coeffs);
+   read_array(y, "R_camera2gimbal", c.camera_to_gimbal);
+diff --git a/io/config.hpp b/io/config.hpp
+index 04b8637..cb58372 100644
+--- a/io/config.hpp
++++ b/io/config.hpp
+@@ -6,6 +6,8 @@ namespace training {
+ struct Config {
+   bool display = true;
+   bool allow_fire = false;
++  // 是否启用能量机关检测（默认关闭：前两项考核只打装甲板，省算力也避免干扰）。
++  bool enable_rune = false;
+   std::array<double, 9> camera_matrix{
+       1303.6753236814714, 0, 720, 0, 1303.6753236814714, 540, 0, 0, 1};
+   std::array<double, 5> distort_coeffs{0, 0, 0, 0, 0};
 diff --git a/lessons/lesson02_io.cpp b/lessons/lesson02_io.cpp
 index a7f8efc..b01440f 100644
 --- a/lessons/lesson02_io.cpp
@@ -981,7 +1009,7 @@ index bb2b357..ba7efc3 100644
  }
  }  // namespace training
 diff --git a/src/main.cpp b/src/main.cpp
-index 4a7bf8c..45a5c0b 100644
+index 4a7bf8c..133a6fb 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
 @@ -1,12 +1,106 @@
@@ -1091,7 +1119,7 @@ index 4a7bf8c..45a5c0b 100644
  
  int main(int argc, char** argv) {
    std::signal(SIGINT, on_signal);
-@@ -17,21 +111,130 @@ int main(int argc, char** argv) {
+@@ -17,21 +111,132 @@ int main(int argc, char** argv) {
    training::TrackingState tracking;
    devices.open();
  
@@ -1119,7 +1147,9 @@ index 4a7bf8c..45a5c0b 100644
      training::Command command{};
      if (input) {
        const auto armors = training::lesson03_detection(input->image);
-+      const auto runes = training::lesson03_rune_detection(input->image);
++      const auto runes = devices.config.enable_rune
++          ? training::lesson03_rune_detection(input->image)
++          : std::vector<training::Rune>{};
 +      if (devices.config.display) {
 +        drawArmors(input->image, armors);
 +        for (const auto& rune : runes) drawRune(input->image, rune);

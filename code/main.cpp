@@ -134,7 +134,9 @@ int main(int argc, char** argv) {
     training::Command command{};
     if (input) {
       const auto armors = training::lesson03_detection(input->image);
-      const auto runes = training::lesson03_rune_detection(input->image);
+      const auto runes = devices.config.enable_rune
+          ? training::lesson03_rune_detection(input->image)
+          : std::vector<training::Rune>{};
       if (devices.config.display) {
         drawArmors(input->image, armors);
         for (const auto& rune : runes) drawRune(input->image, rune);
