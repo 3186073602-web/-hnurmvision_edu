@@ -35,6 +35,7 @@ Config load_config(const std::string& path) {
   if (y["servo_pitch_bias_deg"]) c.servo_pitch_bias_deg = y["servo_pitch_bias_deg"].as<double>();
   if (y["search_on_loss"]) c.search_on_loss = y["search_on_loss"].as<bool>();
   if (y["aim_pitch_trim_deg"]) c.aim_pitch_trim_deg = y["aim_pitch_trim_deg"].as<double>();
+  if (y["calib_sweep"]) c.calib_sweep = y["calib_sweep"].as<bool>();
   read_array(y, "camera_matrix", c.camera_matrix);
   read_array(y, "distort_coeffs", c.distort_coeffs);
   read_array(y, "R_camera2gimbal", c.camera_to_gimbal);

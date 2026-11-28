@@ -18,6 +18,8 @@ struct TrackingState {
   double last_time_sec = 0.0;
   double last_distance = 0.0;
   // 连续丢失帧计数：短时丢失用预测顶住，不立刻清状态。
-  int miss_frames = 0;  // m，PnP 距离，用于选板
+  int miss_frames = 0;
+  // 最近一次被选中的装甲板在相机系下的 PnP 平移（标定用）。
+  Eigen::Vector3d last_camera_xyz = Eigen::Vector3d::Zero();  // m，PnP 距离，用于选板
 };
 }  // namespace training

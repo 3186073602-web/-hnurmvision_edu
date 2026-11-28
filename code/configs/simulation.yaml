@@ -36,3 +36,5 @@ servo_pitch_bias_deg: 2.6
 search_on_loss: false
 # 绝对角瞄准的 pitch 微调（度），用于补偿安装角/标定误差。
 aim_pitch_trim_deg: 0.0
+# 标定扫描：云台在 ±30° 内缓慢摆动并打印 [calib] 日志。
+calib_sweep: false

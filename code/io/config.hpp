@@ -27,6 +27,8 @@ struct Config {
   bool search_on_loss = false;
   // 绝对角瞄准时的 pitch 微调（度）：补偿相机/枪口安装角与标定误差。
   double aim_pitch_trim_deg = 0.0;
+  // 标定扫描模式：让云台在固定范围内缓慢摆动，同时记录 PnP 与真值。
+  bool calib_sweep = false;
   std::array<double, 9> camera_matrix{
       1303.6753236814714, 0, 720, 0, 1303.6753236814714, 540, 0, 0, 1};
   std::array<double, 5> distort_coeffs{0, 0, 0, 0, 0};

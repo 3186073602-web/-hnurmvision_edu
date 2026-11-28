@@ -139,20 +139,44 @@ std::optional<Target> lesson04_tracking(const std::vector<Armor>& armors,
   Eigen::Vector3d best_position = Eigen::Vector3d::Zero();
   double best_distance = 0.0;
 
+  // 已锁定时选“离上一帧位置最近”的板，避免在多块板之间来回跳；
+  // 首次锁定或跳得太远时退回“离相机最近”。
+  const bool tracking = state.valid;
+  double best_score = 0.0;
   for (const auto& armor : armors) {
     Eigen::Vector3d camera_xyz;
     if (!solveArmorPose(armor, calibration, camera_xyz)) continue;
 
-    // 相机系 → 云台系 → 世界系（IMU 稳定系）。
     const Eigen::Vector3d gimbal_xyz =
         calibration.camera_to_gimbal * camera_xyz + calibration.camera_to_gimbal_translation;
     const Eigen::Vector3d world_xyz = imu_q * gimbal_xyz + world_origin;
 
     const double distance = world_xyz.norm();
-    if (!found || distance < best_distance) {
+    const double score = tracking ? (world_xyz - state.position).norm() : distance;
+    if (!found || score < best_score) {
       found = true;
+      best_score = score;
       best_distance = distance;
       best_position = world_xyz;
+      state.last_camera_xyz = camera_xyz;
+    }
+  }
+  if (tracking && found && best_score > 0.8) {
+    // 跳变过大：当作重新捕获，用最近的板。
+    found = false;
+    for (const auto& armor : armors) {
+      Eigen::Vector3d camera_xyz;
+      if (!solveArmorPose(armor, calibration, camera_xyz)) continue;
+      const Eigen::Vector3d gimbal_xyz =
+          calibration.camera_to_gimbal * camera_xyz + calibration.camera_to_gimbal_translation;
+      const Eigen::Vector3d world_xyz = imu_q * gimbal_xyz + world_origin;
+      const double distance = world_xyz.norm();
+      if (!found || distance < best_distance) {
+        found = true;
+        best_distance = distance;
+        best_position = world_xyz;
+        state.last_camera_xyz = camera_xyz;
+      }
     }
   }
 

@@ -1,5 +1,5 @@
 diff --git a/configs/simulation.yaml b/configs/simulation.yaml
-index ae82170..aadb1dc 100644
+index ae82170..77042b3 100644
 --- a/configs/simulation.yaml
 +++ b/configs/simulation.yaml
 @@ -1,6 +1,13 @@
@@ -17,7 +17,7 @@ index ae82170..aadb1dc 100644
  
  # 仿真环境下的相机内参
  camera_matrix: [1303.6753236814714, 0.0, 720.0,
-@@ -10,7 +17,22 @@ distort_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
+@@ -10,7 +17,24 @@ distort_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
  
  # 相机光学坐标系到云台坐标系：p_gimbal = R * p_camera + t。
  # vehicle.glb 中相机/枪口固定仰角为 25°。
@@ -43,6 +43,8 @@ index ae82170..aadb1dc 100644
 +search_on_loss: false
 +# 绝对角瞄准的 pitch 微调（度），用于补偿安装角/标定误差。
 +aim_pitch_trim_deg: 0.0
++# 标定扫描：云台在 ±30° 内缓慢摆动并打印 [calib] 日志。
++calib_sweep: false
 diff --git a/include/lessons.hpp b/include/lessons.hpp
 index 86fa46e..6653bd1 100644
 --- a/include/lessons.hpp
@@ -68,10 +70,10 @@ index 86fa46e..6653bd1 100644
  Command lesson05_aiming(const Target& target, TimePoint timestamp, double bullet_speed);
  }  // namespace training
 diff --git a/include/tracking_state.hpp b/include/tracking_state.hpp
-index 3f3cc22..0925082 100644
+index 3f3cc22..42a3d40 100644
 --- a/include/tracking_state.hpp
 +++ b/include/tracking_state.hpp
-@@ -1,8 +1,23 @@
+@@ -1,8 +1,25 @@
  #pragma once
 +#include <Eigen/Geometry>
 +#include <optional>
@@ -93,7 +95,9 @@ index 3f3cc22..0925082 100644
 +  double last_time_sec = 0.0;
 +  double last_distance = 0.0;
 +  // 连续丢失帧计数：短时丢失用预测顶住，不立刻清状态。
-+  int miss_frames = 0;  // m，PnP 距离，用于选板
++  int miss_frames = 0;
++  // 最近一次被选中的装甲板在相机系下的 PnP 平移（标定用）。
++  Eigen::Vector3d last_camera_xyz = Eigen::Vector3d::Zero();  // m，PnP 距离，用于选板
  };
  }  // namespace training
 diff --git a/include/types.hpp b/include/types.hpp
@@ -119,10 +123,10 @@ index 53d64e7..d5f728d 100644
  
  // 第五讲输出：绝对角使用 rad，IO 边界统一转换单位和方向。
 diff --git a/io/config.cpp b/io/config.cpp
-index 7746963..bef4fa0 100644
+index 7746963..c88fc9e 100644
 --- a/io/config.cpp
 +++ b/io/config.cpp
-@@ -24,6 +24,17 @@ Config load_config(const std::string& path) {
+@@ -24,6 +24,18 @@ Config load_config(const std::string& path) {
    Config c;
    if (y["display"]) c.display = y["display"].as<bool>();
    if (y["allow_fire"]) c.allow_fire = y["allow_fire"].as<bool>();
@@ -137,14 +141,15 @@ index 7746963..bef4fa0 100644
 +  if (y["servo_pitch_bias_deg"]) c.servo_pitch_bias_deg = y["servo_pitch_bias_deg"].as<double>();
 +  if (y["search_on_loss"]) c.search_on_loss = y["search_on_loss"].as<bool>();
 +  if (y["aim_pitch_trim_deg"]) c.aim_pitch_trim_deg = y["aim_pitch_trim_deg"].as<double>();
++  if (y["calib_sweep"]) c.calib_sweep = y["calib_sweep"].as<bool>();
    read_array(y, "camera_matrix", c.camera_matrix);
    read_array(y, "distort_coeffs", c.distort_coeffs);
    read_array(y, "R_camera2gimbal", c.camera_to_gimbal);
 diff --git a/io/config.hpp b/io/config.hpp
-index 04b8637..c1c4115 100644
+index 04b8637..660b932 100644
 --- a/io/config.hpp
 +++ b/io/config.hpp
-@@ -6,6 +6,27 @@ namespace training {
+@@ -6,6 +6,29 @@ namespace training {
  struct Config {
    bool display = true;
    bool allow_fire = false;
@@ -169,14 +174,16 @@ index 04b8637..c1c4115 100644
 +  bool search_on_loss = false;
 +  // 绝对角瞄准时的 pitch 微调（度）：补偿相机/枪口安装角与标定误差。
 +  double aim_pitch_trim_deg = 0.0;
++  // 标定扫描模式：让云台在固定范围内缓慢摆动，同时记录 PnP 与真值。
++  bool calib_sweep = false;
    std::array<double, 9> camera_matrix{
        1303.6753236814714, 0, 720, 0, 1303.6753236814714, 540, 0, 0, 1};
    std::array<double, 5> distort_coeffs{0, 0, 0, 0, 0};
 diff --git a/lessons/lesson02_io.cpp b/lessons/lesson02_io.cpp
-index a7f8efc..deb58bf 100644
+index a7f8efc..30b3637 100644
 --- a/lessons/lesson02_io.cpp
 +++ b/lessons/lesson02_io.cpp
-@@ -1,20 +1,267 @@
+@@ -1,20 +1,291 @@
  #include "io_context.hpp"
 +
 +#include "vision_gt.hpp"
@@ -327,6 +334,30 @@ index a7f8efc..deb58bf 100644
 +    }
 +  }
 +  if (best_error > 1.0) return std::nullopt;  // 最近的板子也差 1m 以上，认为没对上
++  return best;
++}
++
++std::optional<Eigen::Vector3d> nearestArmorInWorld(const Eigen::Vector3d& hint) {
++  Bridge& b = bridge();
++  std::lock_guard<std::mutex> lock(b.mutex);
++  if (!b.has_gimbal || b.armor_positions.empty()) return std::nullopt;
++  const Eigen::Quaterniond base = b.has_odom ? b.odom_rotation.normalized()
++                                             : Eigen::Quaterniond::Identity();
++  const Eigen::Quaterniond gimbal_world = (base * b.gimbal_local_rotation).normalized();
++  const Eigen::Vector3d gimbal_world_position =
++      b.odom_position + base * b.gimbal_local_position;
++  std::optional<Eigen::Vector3d> best;
++  double best_error = 0.0;
++  for (const auto& [name, world] : b.armor_positions) {
++    (void)name;
++    const Eigen::Vector3d relative = gimbal_world.inverse() * (world - gimbal_world_position);
++    const double error = (relative - hint).norm();
++    if (!best || error < best_error) {
++      best = world;
++      best_error = error;
++    }
++  }
++  if (best_error > 1.0) return std::nullopt;
 +  return best;
 +}
 +
@@ -913,10 +944,10 @@ index c9cbbd8..b7587d5 100644
  }
  }  // namespace training
 diff --git a/lessons/lesson04_tracking.cpp b/lessons/lesson04_tracking.cpp
-index d0a03a2..24a8c42 100644
+index d0a03a2..0e323ed 100644
 --- a/lessons/lesson04_tracking.cpp
 +++ b/lessons/lesson04_tracking.cpp
-@@ -1,28 +1,233 @@
+@@ -1,28 +1,257 @@
  #include "lessons.hpp"
  
 +#include <opencv2/calib3d.hpp>
@@ -1078,20 +1109,44 @@ index d0a03a2..24a8c42 100644
 +  Eigen::Vector3d best_position = Eigen::Vector3d::Zero();
 +  double best_distance = 0.0;
 +
++  // 已锁定时选“离上一帧位置最近”的板，避免在多块板之间来回跳；
++  // 首次锁定或跳得太远时退回“离相机最近”。
++  const bool tracking = state.valid;
++  double best_score = 0.0;
 +  for (const auto& armor : armors) {
 +    Eigen::Vector3d camera_xyz;
 +    if (!solveArmorPose(armor, calibration, camera_xyz)) continue;
 +
-+    // 相机系 → 云台系 → 世界系（IMU 稳定系）。
 +    const Eigen::Vector3d gimbal_xyz =
 +        calibration.camera_to_gimbal * camera_xyz + calibration.camera_to_gimbal_translation;
 +    const Eigen::Vector3d world_xyz = imu_q * gimbal_xyz + world_origin;
 +
 +    const double distance = world_xyz.norm();
-+    if (!found || distance < best_distance) {
++    const double score = tracking ? (world_xyz - state.position).norm() : distance;
++    if (!found || score < best_score) {
 +      found = true;
++      best_score = score;
 +      best_distance = distance;
 +      best_position = world_xyz;
++      state.last_camera_xyz = camera_xyz;
++    }
++  }
++  if (tracking && found && best_score > 0.8) {
++    // 跳变过大：当作重新捕获，用最近的板。
++    found = false;
++    for (const auto& armor : armors) {
++      Eigen::Vector3d camera_xyz;
++      if (!solveArmorPose(armor, calibration, camera_xyz)) continue;
++      const Eigen::Vector3d gimbal_xyz =
++          calibration.camera_to_gimbal * camera_xyz + calibration.camera_to_gimbal_translation;
++      const Eigen::Vector3d world_xyz = imu_q * gimbal_xyz + world_origin;
++      const double distance = world_xyz.norm();
++      if (!found || distance < best_distance) {
++        found = true;
++        best_distance = distance;
++        best_position = world_xyz;
++        state.last_camera_xyz = camera_xyz;
++      }
 +    }
 +  }
 +
@@ -1252,10 +1307,10 @@ index bb2b357..ba7efc3 100644
  }
  }  // namespace training
 diff --git a/src/main.cpp b/src/main.cpp
-index 4a7bf8c..63e3fd4 100644
+index 4a7bf8c..acb43b2 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
-@@ -1,12 +1,106 @@
+@@ -1,13 +1,107 @@
  #include "lessons.hpp"
  #include "io_context.hpp"
 +#include "vision_gt.hpp"
@@ -1304,8 +1359,8 @@ index 4a7bf8c..63e3fd4 100644
 +  std::snprintf(label, sizeof(label), "RUNE %.2f", rune.confidence);
 +  cv::putText(frame, label, cv::Point(polygon[0].x, std::max(14, polygon[0].y - 6)),
 +              cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 235, 255), 1, cv::LINE_AA);
-+}
-+
+ }
+ 
 +void drawArmors(cv::Mat& frame, const std::vector<training::Armor>& armors) {
 +  // 只影响显示：检测角点是灯条外沿（P nP 用的物理尺寸），画框时外扩到整块板。
 +  constexpr float kWiden = 1.35F;
@@ -1357,12 +1412,13 @@ index 4a7bf8c..63e3fd4 100644
 +                cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 255), 2,
 +                cv::LINE_AA);
 +  }
- }
++}
 +}  // namespace
- 
++
  int main(int argc, char** argv) {
    std::signal(SIGINT, on_signal);
-@@ -17,21 +111,145 @@ int main(int argc, char** argv) {
+   std::signal(SIGTERM, on_signal);
+@@ -17,21 +111,166 @@ int main(int argc, char** argv) {
    training::TrackingState tracking;
    devices.open();
  
@@ -1399,7 +1455,15 @@ index 4a7bf8c..63e3fd4 100644
 -          armors, input->timestamp, input->imu_q, calibration, tracking);
 -      if (target)
 +          armors, input->timestamp, input->imu_q, input->gimbal_origin, calibration, tracking);
-+      if (target) {
++      if (devices.config.calib_sweep) {
++        // 标定扫描：绕初始方向 ±30°、俯仰 ±17° 缓慢摆动，采集多姿态样本。
++        static double phase = 0.0;
++        phase += 0.02;
++        command.control = true;
++        command.shoot = false;
++        command.yaw = -training::kPi * 0.5 + 0.03 * std::sin(phase * 0.9);
++        command.pitch = 0.17 * std::sin(phase * 0.7) + 25.0 * training::kPi / 180.0;
++      } else if (target) {
          command = training::lesson05_aiming(*target, input->timestamp, input->bullet_speed);
 +        if (std::getenv("AIM_DEBUG") != nullptr && armors.size() == 1) {
 +          const Eigen::Vector3d relative = input->imu_q.inverse() * target->position;
@@ -1419,6 +1483,19 @@ index 4a7bf8c..63e3fd4 100644
 +        // 火控：有解且允许开火时持续请求发射；云台对齐后弹丸自然命中。
 +        if (command.control && devices.config.allow_fire) command.shoot = true;
 +
++      }
++
++      if (devices.config.calib_sweep && target && !armors.empty()) {
++        const Eigen::Vector3d relative = input->imu_q.inverse() * target->position;
++        if (const auto gt = training::io::nearestArmorInWorld(relative)) {
++          const Eigen::Quaterniond& q = input->imu_q;
++          std::fprintf(stderr,
++                       "[calib] t=(%.4f,%.4f,%.4f) q=(%.6f,%.6f,%.6f,%.6f) gim=(%.4f,%.4f,%.4f) gt=(%.4f,%.4f,%.4f)\n",
++                       tracking.last_camera_xyz.x(), tracking.last_camera_xyz.y(),
++                       tracking.last_camera_xyz.z(), q.w(), q.x(), q.y(), q.z(),
++                       input->gimbal_origin.x(), input->gimbal_origin.y(),
++                       input->gimbal_origin.z(), gt->x(), gt->y(), gt->z());
++        }
 +      }
 +
 +      // 第四讲可视化：PnP 位姿 vs 仿真真值；预测 250ms 后的位置并统计误差。

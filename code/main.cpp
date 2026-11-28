@@ -141,7 +141,15 @@ int main(int argc, char** argv) {
       }
       const auto target = training::lesson04_tracking(
           armors, input->timestamp, input->imu_q, input->gimbal_origin, calibration, tracking);
-      if (target) {
+      if (devices.config.calib_sweep) {
+        // 标定扫描：绕初始方向 ±30°、俯仰 ±17° 缓慢摆动，采集多姿态样本。
+        static double phase = 0.0;
+        phase += 0.02;
+        command.control = true;
+        command.shoot = false;
+        command.yaw = -training::kPi * 0.5 + 0.03 * std::sin(phase * 0.9);
+        command.pitch = 0.17 * std::sin(phase * 0.7) + 25.0 * training::kPi / 180.0;
+      } else if (target) {
         command = training::lesson05_aiming(*target, input->timestamp, input->bullet_speed);
         if (std::getenv("AIM_DEBUG") != nullptr && armors.size() == 1) {
           const Eigen::Vector3d relative = input->imu_q.inverse() * target->position;
@@ -161,6 +169,19 @@ int main(int argc, char** argv) {
         // 火控：有解且允许开火时持续请求发射；云台对齐后弹丸自然命中。
         if (command.control && devices.config.allow_fire) command.shoot = true;
 
+      }
+
+      if (devices.config.calib_sweep && target && !armors.empty()) {
+        const Eigen::Vector3d relative = input->imu_q.inverse() * target->position;
+        if (const auto gt = training::io::nearestArmorInWorld(relative)) {
+          const Eigen::Quaterniond& q = input->imu_q;
+          std::fprintf(stderr,
+                       "[calib] t=(%.4f,%.4f,%.4f) q=(%.6f,%.6f,%.6f,%.6f) gim=(%.4f,%.4f,%.4f) gt=(%.4f,%.4f,%.4f)\n",
+                       tracking.last_camera_xyz.x(), tracking.last_camera_xyz.y(),
+                       tracking.last_camera_xyz.z(), q.w(), q.x(), q.y(), q.z(),
+                       input->gimbal_origin.x(), input->gimbal_origin.y(),
+                       input->gimbal_origin.z(), gt->x(), gt->y(), gt->z());
+        }
       }
 
       // 第四讲可视化：PnP 位姿 vs 仿真真值；预测 250ms 后的位置并统计误差。

@@ -151,6 +151,30 @@ std::optional<Eigen::Vector3d> nearestArmorInGimbal(const Eigen::Vector3d& hint)
   return best;
 }
 
+std::optional<Eigen::Vector3d> nearestArmorInWorld(const Eigen::Vector3d& hint) {
+  Bridge& b = bridge();
+  std::lock_guard<std::mutex> lock(b.mutex);
+  if (!b.has_gimbal || b.armor_positions.empty()) return std::nullopt;
+  const Eigen::Quaterniond base = b.has_odom ? b.odom_rotation.normalized()
+                                             : Eigen::Quaterniond::Identity();
+  const Eigen::Quaterniond gimbal_world = (base * b.gimbal_local_rotation).normalized();
+  const Eigen::Vector3d gimbal_world_position =
+      b.odom_position + base * b.gimbal_local_position;
+  std::optional<Eigen::Vector3d> best;
+  double best_error = 0.0;
+  for (const auto& [name, world] : b.armor_positions) {
+    (void)name;
+    const Eigen::Vector3d relative = gimbal_world.inverse() * (world - gimbal_world_position);
+    const double error = (relative - hint).norm();
+    if (!best || error < best_error) {
+      best = world;
+      best_error = error;
+    }
+  }
+  if (best_error > 1.0) return std::nullopt;
+  return best;
+}
+
 void IoContext::open() {
   Bridge& b = bridge();
   if (b.started) return;
